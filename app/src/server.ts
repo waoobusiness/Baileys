@@ -23,10 +23,11 @@ const ZURIA_WEBHOOK_URL = process.env.ZURIA_WEBHOOK_URL || "" // pour pousser le
 let sockGlobal: any = null
 let latestQR: string | null = null  // dernier QR reçu (string)
 
-function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!API_KEY) return next() // désactivé si non défini
-  const key = req.headers["x-api-key"]
-  if (key === API_KEY) return next()
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next()
+  const headerKey = req.headers["x-api-key"]
+  const queryKey = typeof req.query.key === "string" ? req.query.key : undefined
+  if (headerKey === API_KEY || queryKey === API_KEY) return next()
   return res.status(401).json({ error: "unauthorized" })
 }
 
