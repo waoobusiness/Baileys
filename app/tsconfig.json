@@ -6,7 +6,8 @@
     "outDir": "dist",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "strict": false
+    "strict": false,
+    "lib": ["ES2020", "DOM"]
   },
   "include": ["src"]
 }
