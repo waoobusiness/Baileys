@@ -1,484 +1,393 @@
 import express from "express"
 import pino from "pino"
-import path from "node:path"
-import fs from "node:fs/promises"
-import crypto from "node:crypto"
+import QRCode from "qrcode"
 import makeWASocket, {
   Browsers,
   DisconnectReason,
   useMultiFileAuthState
 } from "@whiskeysockets/baileys"
 
-type ChatLite = {
-  id: string
-  name?: string
-  unreadCount?: number
-  conversationTimestamp?: number
-}
-
-type ContactLite = {
-  jid: string
-  name?: string | null
-  verifiedName?: string | null
-  isBusiness?: boolean
-  isEnterprise?: boolean
-}
-
-type MessageLite = {
-  key: any
-  message?: any
-  messageTimestamp?: number
-  pushName?: string
-  fromMe?: boolean
-}
-
-type SessionData = {
+type SessionCtx = {
   id: string
   authDir: string
   sock: any | null
-  status: "connecting" | "connected" | "closed"
-  qr?: string | null
-  // caches in-memory (optionnel, à persister plus tard si besoin)
-  chats: Map<string, ChatLite>
-  contacts: Map<string, ContactLite>
-  messagesByJid: Map<string, MessageLite[]>
+  lastQR: string | null
+  pairingCode: string | null
+  webhook?: { url: string; secret?: string } | null
+  contacts: Map<string, any>
+  chats: Map<string, any>
 }
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" })
 
-// IMPORTANT: sur Render, monte le disque sur /var/data
-const DATA_DIR = process.env.DATA_DIR || "/var/data"
-const API_KEY = process.env.API_KEY || process.env.FURIA_API_KEY || "MY_PRIVATE_FURIA_API_KEY_2025"
+// ---------- Config ----------
+const PORT = Number(process.env.PORT || 3001)
+// dossier persistant du disque Render (monte ton disk sur /var/data)
+const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || "/var/data/baileys"
+// sécurité API
+const API_KEY = process.env.API_KEY || "MY_PRIVATE_FURIA_API_KEY_2025"
 
-// session “par défaut” (pour compat avec /qr, /send)
+// session par défaut conservée pour rétro-compat (/qr, /send)
 const DEFAULT_SESSION_ID = process.env.DEFAULT_SESSION_ID || "default"
 
-// port Render
-const PORT = Number(process.env.PORT || 3001)
+// ---------- Mémoire des sessions ----------
+const sessions = new Map<string, SessionCtx>()
 
-// ---------------------------
-// State mémoire multi-sessions
-// ---------------------------
-const sessions = new Map<string, SessionData>()
+function ensureCtx(sessionId: string): SessionCtx {
+  if (!sessions.has(sessionId)) {
+    const ctx: SessionCtx = {
+      id: sessionId,
+      authDir: `${AUTH_BASE_DIR}/sessions/${sessionId}`,
+      sock: null,
+      lastQR: null,
+      pairingCode: null,
+      webhook: null,
+      contacts: new Map(),
+      chats: new Map()
+    }
+    sessions.set(sessionId, ctx)
+  }
+  return sessions.get(sessionId)!
+}
 
-function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const incoming = req.header("x-api-key") || req.query.key
-  if (!incoming || String(incoming) !== API_KEY) {
+// ---------- Démarrage d’une socket ----------
+async function startSocket(ctx: SessionCtx, opts?: { printQRInTerminal?: boolean }) {
+  const { state, saveCreds } = await useMultiFileAuthState(ctx.authDir)
+
+  const sock = makeWASocket({
+    auth: state,
+    browser: Browsers.ubuntu("Zuria/Gateway"),
+    markOnlineOnConnect: false,
+    printQRInTerminal: Boolean(opts?.printQRInTerminal)
+  })
+
+  // met à jour le QR quand dispo
+  sock.ev.on("connection.update", (update: any) => {
+    const { connection, lastDisconnect, qr } = update
+    if (qr) {
+      ctx.lastQR = qr
+      logger.info({ session: ctx.id }, "QR updated")
+    }
+    if (connection === "close") {
+      const status = (lastDisconnect as any)?.error?.output?.statusCode
+      const shouldReconnect = status !== DisconnectReason.loggedOut
+      logger.warn({ session: ctx.id, status }, "connection closed")
+      if (shouldReconnect) {
+        startSocket(ctx).catch((e) => logger.error(e, "reconnect failed"))
+      }
+    }
+    if (connection === "open") {
+      ctx.lastQR = null
+      logger.info({ session: ctx.id }, "✅ socket OPEN")
+    }
+  })
+
+  // persiste les creds
+  sock.ev.on("creds.update", saveCreds)
+
+  // hydrate mini-store
+  sock.ev.on("contacts.upsert", (contacts: any[]) => {
+    for (const c of contacts) ctx.contacts.set(c.id || c.jid, c)
+  })
+  sock.ev.on("contacts.update", (contacts: any[]) => {
+    for (const c of contacts) {
+      const id = (c as any).id || (c as any).jid
+      const prev = ctx.contacts.get(id) || {}
+      ctx.contacts.set(id, { ...prev, ...c })
+    }
+  })
+  sock.ev.on("chats.upsert", (chats: any[]) => {
+    for (const ch of chats) ctx.chats.set(ch.id, ch)
+  })
+  sock.ev.on("chats.update", (chats: any[]) => {
+    for (const ch of chats) {
+      const id = (ch as any).id
+      const prev = ctx.chats.get(id) || {}
+      ctx.chats.set(id, { ...prev, ...ch })
+    }
+  })
+  sock.ev.on("messages.upsert", async (ev: any) => {
+    for (const m of ev.messages || []) {
+      logger.info({ session: ctx.id, from: m.key?.remoteJid, id: m.key?.id }, "message")
+      // exemple simple d’auto-reply si tu veux
+      // if (!m.key.fromMe) await sock.sendMessage(m.key.remoteJid!, { text: "🤖 Zuria est connecté." })
+    }
+  })
+
+  ctx.sock = sock
+  return sock
+}
+
+// ---------- Middleware auth ----------
+function auth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const key = req.header("x-api-key") || (req.query.key as string)
+  if (!API_KEY || key !== API_KEY) {
     return res.status(401).json({ error: "unauthorized" })
   }
   next()
 }
 
-async function ensureDir(dir: string) {
-  await fs.mkdir(dir, { recursive: true })
-}
-
-function sessionAuthDir(id: string) {
-  return path.join(DATA_DIR, "sessions", id)
-}
-
-function getOrCreateSession(id: string): SessionData {
-  if (sessions.has(id)) return sessions.get(id)!
-  const s: SessionData = {
-    id,
-    authDir: sessionAuthDir(id),
-    sock: null,
-    status: "closed",
-    qr: null,
-    chats: new Map(),
-    contacts: new Map(),
-    messagesByJid: new Map()
-  }
-  sessions.set(id, s)
-  return s
-}
-
-async function startSession(id: string, opts?: { usePairingCode?: boolean; phoneNumber?: string | null }) {
-  const s = getOrCreateSession(id)
-  await ensureDir(s.authDir)
-
-  const { state, saveCreds } = await useMultiFileAuthState(s.authDir)
-
-  const sock = makeWASocket({
-    auth: state,
-    browser: Browsers.ubuntu("Zuria/Render"),
-    // Télécharge l’historique après connexion (chats, contacts, messages)
-    // Ces données arrivent via l’événement "messaging-history.set"
-    // Doc: History Sync (messaging-history.set). :contentReference[oaicite:0]{index=0}
-    syncFullHistory: true,
-    printQRInTerminal: false,
-    markOnlineOnConnect: false
-  })
-
-  s.sock = sock
-  s.status = "connecting"
-  s.qr = null
-
-  sock.ev.on("creds.update", saveCreds)
-
-  sock.ev.on("connection.update", ({ connection, qr, lastDisconnect }) => {
-    if (qr) {
-      s.qr = qr
-    }
-    if (connection === "open") {
-      logger.info({ id }, "✅ session connected")
-      s.status = "connected"
-      s.qr = null
-    } else if (connection === "close") {
-      const code = (lastDisconnect as any)?.error?.output?.statusCode
-      const shouldReconnect = code !== DisconnectReason.loggedOut
-      logger.warn({ id, code, shouldReconnect }, "connection closed")
-      s.status = "closed"
-      s.qr = null
-      if (shouldReconnect) {
-        // relance douce
-        setTimeout(() => startSession(id).catch(() => {}), 3000)
-      }
-    }
-  })
-
-  // Historique initial (chats, contacts, messages)
-  sock.ev.on("messaging-history.set", (payload: any) => {
-    const { chats = [], contacts = [], messages = [] } = payload || {}
-    // chats
-    for (const c of chats as any[]) {
-      const chat: ChatLite = {
-        id: c.id || c.jid || c?.key?.remoteJid || "",
-        name: (c as any).name,
-        unreadCount: (c as any).unreadCount,
-        conversationTimestamp: (c as any).conversationTimestamp
-      }
-      if (chat.id) s.chats.set(chat.id, chat)
-    }
-    // contacts
-    for (const c of contacts as any[]) {
-      const contact: ContactLite = {
-        jid: c.id || c.jid,
-        name: (c as any).name ?? (c as any).notify,
-        verifiedName: (c as any).verifiedName ?? null,
-        isBusiness: Boolean((c as any).isBusiness),
-        isEnterprise: Boolean((c as any).isEnterprise)
-      }
-      if (contact.jid) s.contacts.set(contact.jid, contact)
-    }
-    // messages
-    for (const m of messages as any[]) {
-      const jid = m?.key?.remoteJid
-      if (!jid) continue
-      const arr = s.messagesByJid.get(jid) || []
-      arr.push({
-        key: m.key,
-        message: m.message,
-        messageTimestamp: Number(m.messageTimestamp || m.message?.messageTimestamp) || undefined,
-        pushName: m.pushName,
-        fromMe: m.key?.fromMe
-      })
-      // limite mémoire simple (200 derniers)
-      if (arr.length > 200) arr.splice(0, arr.length - 200)
-      s.messagesByJid.set(jid, arr)
-    }
-  })
-
-  // Chats runtime
-  sock.ev.on("chats.upsert", (chs: any[]) => {
-    for (const c of chs) {
-      const chat: ChatLite = {
-        id: c.id || c.jid,
-        name: c.name,
-        unreadCount: c.unreadCount,
-        conversationTimestamp: c.conversationTimestamp
-      }
-      if (chat.id) s.chats.set(chat.id, chat)
-    }
-  })
-  sock.ev.on("chats.update", (chs: any[]) => {
-    for (const c of chs) {
-      const id = c.id || c.jid
-      if (!id) continue
-      const prev = s.chats.get(id) || { id }
-      s.chats.set(id, { ...prev, ...c })
-    }
-  })
-  sock.ev.on("chats.delete", (ids: string[]) => {
-    for (const id of ids) s.chats.delete(id)
-  })
-
-  // Contacts runtime
-  sock.ev.on("contacts.upsert", (cts: any[]) => {
-    for (const c of cts) {
-      const contact: ContactLite = {
-        jid: c.id || c.jid,
-        name: c.name ?? c.notify,
-        verifiedName: c.verifiedName ?? null,
-        isBusiness: Boolean(c.isBusiness),
-        isEnterprise: Boolean(c.isEnterprise)
-      }
-      if (contact.jid) s.contacts.set(contact.jid, { ...(s.contacts.get(contact.jid) || {}), ...contact })
-    }
-  })
-
-  // Messages runtime
-  sock.ev.on("messages.upsert", (ev: any) => {
-    const { messages = [] } = ev || {}
-    for (const m of messages) {
-      const jid = m?.key?.remoteJid
-      if (!jid) continue
-      const arr = s.messagesByJid.get(jid) || []
-      arr.push({
-        key: m.key,
-        message: m.message,
-        messageTimestamp: Number(m.messageTimestamp || m.message?.messageTimestamp) || undefined,
-        pushName: m.pushName,
-        fromMe: m.key?.fromMe
-      })
-      if (arr.length > 200) arr.splice(0, arr.length - 200)
-      s.messagesByJid.set(jid, arr)
-    }
-  })
-
-  // Pairing code (si demandé et non enregistré)
-  if (opts?.usePairingCode && opts.phoneNumber && !sock.authState.creds.registered) {
-    const code = await sock.requestPairingCode(String(opts.phoneNumber))
-    logger.warn({ id, pairingCode: code }, "PAIRING CODE (WhatsApp > Appareils liés > Associer par numéro)")
-  }
-
-  return s
-}
-
-// ------------------------------------
-// Helpers d’accès aux sessions & socket
-// ------------------------------------
-function mustSession(id: string): SessionData {
-  const s = sessions.get(id)
-  if (!s) throw new Error("session-not-found")
-  if (!s.sock) throw new Error("session-not-ready")
-  return s
-}
-
-// ---------------
-// Serveur Express
-// ---------------
+// ---------- App ----------
 const app = express()
 app.use(express.json())
 
-app.get("/", (_req, res) => res.send("ok"))
-app.get("/health", (_req, res) => res.json({ ok: true }))
-app.get("/qr", requireApiKey, async (_req, res) => {
-  try {
-    const s = getOrCreateSession(DEFAULT_SESSION_ID)
-    if (s.status === "closed" || !s.sock) await startSession(DEFAULT_SESSION_ID)
-    if (s.status === "connected") return res.json({ error: "already-connected" })
-    if (!s.qr) return res.status(404).json({ error: "no-qr-available" })
-    return res.json({ sessionId: s.id, qr: s.qr })
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "qr-failed" })
-  }
-})
+app.get("/", (_, res) => res.send("ok"))
+app.get("/health", (_, res) => res.json({ ok: true }))
 
 // -----------------------------
-// API multi-sessions (pour Zuria)
+// MULTI-SESSIONS
 // -----------------------------
 
-// Liste des sessions
-app.get("/sessions", requireApiKey, (_req, res) => {
-  const all = [...sessions.values()].map((s) => ({
-    sessionId: s.id,
-    status: s.status,
-    chatCount: s.chats.size,
-    contactCount: s.contacts.size
-  }))
-  res.json({ sessions: all })
-})
-
-// Créer/Init une session
-app.post("/sessions/init", requireApiKey, async (req, res) => {
+/**
+ * Crée (ou redémarre) une session & (optionnel) déclenche le pairing code.
+ * body: { sessionId: string, usePairingCode?: boolean, phoneNumber?: string, customPair?: string }
+ */
+app.post("/sessions/init", auth, async (req, res) => {
   try {
-    const { sessionId, usePairingCode = false, phoneNumber = null } = req.body || {}
-    const id = sessionId || crypto.randomUUID()
-    const s = await startSession(id, { usePairingCode, phoneNumber })
+    const { sessionId, usePairingCode, phoneNumber, customPair } = req.body || {}
+    if (!sessionId) return res.status(400).json({ error: "sessionId required" })
+    const ctx = ensureCtx(sessionId)
 
-    // si QR dispo immédiatement
+    // (re)démarre la socket si absente
+    if (!ctx.sock) {
+      await startSocket(ctx)
+    }
+
+    let pairingCode: string | null = null
+    // Si pairing demandé
+    if (usePairingCode && phoneNumber && !ctx.sock.authState?.creds?.registered) {
+      // API officielle: requestPairingCode(number, customPair?)
+      pairingCode = await ctx.sock.requestPairingCode(String(phoneNumber), customPair || undefined)
+      ctx.pairingCode = pairingCode
+      logger.warn({ session: sessionId, pairingCode }, "PAIRING CODE")
+    }
+
     return res.json({
-      success: true,
-      sessionId: s.id,
-      status: s.status,
-      qr: s.qr || null
+      sessionId,
+      status: ctx.sock?.user ? "connected" : "connecting",
+      isConnected: Boolean(ctx.sock?.user),
+      pairingCode
     })
   } catch (e: any) {
-    logger.error(e)
-    res.status(500).json({ error: e?.message || "init-failed" })
+    logger.error(e, "init failed")
+    return res.status(500).json({ error: e?.message || "init failed" })
   }
 })
 
-// Statut d’une session
-app.get("/sessions/:id", requireApiKey, (req, res) => {
+/**
+ * Demande/renvoie un pairing code pour une session existante
+ * body: { phoneNumber: string, customPair?: string }
+ */
+app.post("/sessions/:id/pairing-code", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    const me = s.sock?.user || s.sock?.user?.id || null
-    const phoneNumber =
-      (s.sock?.user?.id && String(s.sock.user.id).split(":")[0]) || null
-    res.json({
-      sessionId: s.id,
-      status: s.status,
-      isConnected: s.status === "connected",
+    const sessionId = req.params.id
+    const { phoneNumber, customPair } = req.body || {}
+    if (!phoneNumber) return res.status(400).json({ error: "phoneNumber required" })
+
+    const ctx = ensureCtx(sessionId)
+    if (!ctx.sock) await startSocket(ctx)
+
+    if (ctx.sock.authState?.creds?.registered) {
+      return res.status(400).json({ error: "already registered" })
+    }
+
+    const code = await ctx.sock.requestPairingCode(String(phoneNumber), customPair || undefined)
+    ctx.pairingCode = code
+    logger.warn({ session: sessionId, pairingCode: code }, "PAIRING CODE")
+    return res.json({ sessionId, pairingCode: code })
+  } catch (e: any) {
+    logger.error(e, "pairing-code failed")
+    return res.status(500).json({ error: e?.message || "pairing failed" })
+  }
+})
+
+/**
+ * Statut session
+ */
+app.get("/sessions/:id", auth, async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const ctx = ensureCtx(sessionId)
+    if (!ctx.sock) await startSocket(ctx)
+
+    const me = ctx.sock?.user || null
+    const phoneNumber = me?.id ? String(me.id).split(":")[0] : null
+
+    return res.json({
+      sessionId,
+      status: me ? "connected" : "connecting",
+      isConnected: Boolean(me),
       me,
       phoneNumber,
-      counts: {
-        chats: s.chats.size,
-        contacts: s.contacts.size
-      }
+      counts: { chats: ctx.chats.size, contacts: ctx.contacts.size },
+      qrAvailable: !me && Boolean(ctx.lastQR),
+      pairingAvailable: !me && !ctx.lastQR
     })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "status-failed" })
+    return res.status(500).json({ error: e?.message || "status failed" })
   }
 })
 
-// Obtenir QR d’une session
-app.get("/sessions/:id/qr", requireApiKey, (req, res) => {
+/**
+ * Récupère le QR courant (string + image dataURL)
+ */
+app.get("/sessions/:id/qr", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    if (s.status === "connected") return res.status(409).json({ error: "already-connected" })
-    if (!s.qr) return res.status(404).json({ error: "no-qr-available" })
-    res.json({ sessionId: s.id, qr: s.qr })
+    const sessionId = req.params.id
+    const ctx = ensureCtx(sessionId)
+    if (!ctx.sock) await startSocket(ctx)
+
+    if (!ctx.lastQR) {
+      return res.status(404).json({ error: "no-qr-available" })
+    }
+    const dataUrl = await QRCode.toDataURL(ctx.lastQR)
+    return res.json({ sessionId, qr: ctx.lastQR, qrImageDataUrl: dataUrl })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "qr-failed" })
+    return res.status(500).json({ error: e?.message || "qr failed" })
   }
 })
 
-// Déconnexion
-app.post("/sessions/:id/logout", requireApiKey, async (req, res) => {
+/**
+ * Contacts (liste légère)
+ */
+app.get("/sessions/:id/contacts", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    await s.sock?.logout?.()
-    s.status = "closed"
-    s.qr = null
-    res.json({ success: true })
+    const ctx = ensureCtx(req.params.id)
+    if (!ctx.sock) await startSocket(ctx)
+
+    const list = Array.from(ctx.contacts.values()).map((c: any) => ({
+      jid: c.id || c.jid,
+      name: c.name || c.notify || null,
+      verifiedName: c.verifiedName || null,
+      isBusiness: Boolean(c.isBusiness),
+      isEnterprise: Boolean(c.isEnterprise),
+      imgUrl: c.imgUrl ?? null
+    }))
+    return res.json({ sessionId: ctx.id, count: list.length, contacts: list })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "logout-failed" })
+    return res.status(500).json({ error: e?.message || "contacts failed" })
   }
 })
 
-// Envoi message (POST)
-app.post("/sessions/:id/messages/send", requireApiKey, async (req, res) => {
+/**
+ * Photo de profil d’un contact
+ * /sessions/:id/contacts/photo?jid=xxx@s.whatsapp.net&type=image|preview
+ */
+app.get("/sessions/:id/contacts/photo", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    const { to, text } = req.body || {}
-    if (!to || !text) return res.status(400).json({ error: "missing to or text" })
-    const jid = /@s\.whatsapp\.net$/.test(String(to)) ? String(to) : `${to}@s.whatsapp.net`
-    const r = await s.sock.sendMessage(jid, { text })
-    res.json({ success: true, response: r })
-  } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "send-failed" })
-  }
-})
+    const ctx = ensureCtx(req.params.id)
+    if (!ctx.sock) await startSocket(ctx)
 
-// Liste des chats (triés par timestamp décroissant)
-app.get("/sessions/:id/chats", requireApiKey, (req, res) => {
-  try {
-    const s = mustSession(req.params.id)
-    const limit = Number(req.query.limit || 50)
-    const list = [...s.chats.values()]
-      .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
-      .slice(0, limit)
-    res.json({ sessionId: s.id, count: list.length, chats: list })
-  } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "chats-failed" })
-  }
-})
-
-// Messages d’un chat (depuis le cache mémoire)
-app.get("/sessions/:id/messages", requireApiKey, (req, res) => {
-  try {
-    const s = mustSession(req.params.id)
     const jid = String(req.query.jid || "")
-    const limit = Number(req.query.limit || 50)
-    if (!jid) return res.status(400).json({ error: "missing jid" })
-    const all = s.messagesByJid.get(jid) || []
-    const slice = all.slice(-limit)
-    res.json({ sessionId: s.id, jid, count: slice.length, messages: slice })
+    const type = (String(req.query.type || "preview") as "image" | "preview")
+    if (!jid) return res.status(400).json({ error: "jid required" })
+
+    const url = await ctx.sock.profilePictureUrl(jid, type, 10000)
+    return res.json({ jid, type, url })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "messages-failed" })
+    return res.status(500).json({ error: e?.message || "pp failed" })
   }
 })
 
-// Contacts (depuis le cache)
-app.get("/sessions/:id/contacts", requireApiKey, (req, res) => {
+/**
+ * Chats (les derniers)
+ */
+app.get("/sessions/:id/chats", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    const list = [...s.contacts.values()]
-    res.json({ sessionId: s.id, count: list.length, contacts: list })
+    const ctx = ensureCtx(req.params.id)
+    if (!ctx.sock) await startSocket(ctx)
+
+    const limit = Math.min(Number(req.query.limit || 50), 200)
+    // renvoie ce qu’on a en mémoire (le full history arrivera après la connexion)
+    const all = Array.from(ctx.chats.values())
+      .slice(0, limit)
+      .map((ch: any) => ({
+        id: ch.id,
+        name: ch.name || ch.subject || ch.displayName || null,
+        unreadCount: ch.unreadCount || 0,
+        archived: Boolean(ch.archive)
+      }))
+
+    return res.json({ sessionId: ctx.id, chats: all })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "contacts-failed" })
+    return res.status(500).json({ error: e?.message || "chats failed" })
   }
 })
 
-// Photo de profil d’un contact (redirect/json/download)
-app.get("/sessions/:id/contacts/:jid/photo", requireApiKey, async (req, res) => {
+/**
+ * Envoi texte simple
+ * body: { to: "4179...", text: "hello" }
+ */
+app.post("/sessions/:id/messages/send", auth, async (req, res) => {
   try {
-    const s = mustSession(req.params.id)
-    const jid = decodeURIComponent(String(req.params.jid))
-    const size = (String(req.query.size || "image") as "image" | "preview")
-    const mode = String(req.query.mode || "json") // json | redirect | download
+    const ctx = ensureCtx(req.params.id)
+    if (!ctx.sock) await startSocket(ctx)
 
-    // Méthode officielle Baileys pour obtenir l’URL de la photo. :contentReference[oaicite:1]{index=1}
-    const url = await s.sock.profilePictureUrl(jid, size)
+    const to = String(req.body?.to || "").trim()
+    const text = String(req.body?.text || "").trim()
+    if (!to || !text) return res.status(400).json({ error: "to & text required" })
 
-    if (!url) {
-      return res.status(404).json({ error: "no-photo" })
-    }
-
-    if (mode === "redirect") {
-      return res.redirect(url)
-    } else if (mode === "download") {
-      const r = await fetch(url)
-      if (!r.ok || !r.body) return res.status(502).json({ error: "fetch-failed" })
-      res.setHeader("Content-Type", r.headers.get("content-type") || "application/octet-stream")
-      res.setHeader("Cache-Control", "public, max-age=300")
-      r.body.pipeTo((res as any).stream)
-      return
-    } else {
-      return res.json({ sessionId: s.id, jid, url, size })
-    }
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`
+    const r = await ctx.sock.sendMessage(jid, { text })
+    return res.json({ ok: true, id: r?.key?.id })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(404).json({ error: "not-found" })
-    res.status(500).json({ error: e?.message || "photo-failed" })
+    return res.status(500).json({ error: e?.message || "send failed" })
   }
 })
 
-// ------------------------
-// Compat ancienne /send
-// ------------------------
-app.post("/send", requireApiKey, async (req, res) => {
+/**
+ * Logout + cleanup optionnel
+ */
+app.post("/sessions/:id/logout", auth, async (req, res) => {
   try {
-    const s = mustSession(DEFAULT_SESSION_ID)
-    const { to, text } = req.body || {}
-    if (!to || !text) return res.status(400).json({ error: "Missing to or text" })
-    const jid = /@s\.whatsapp\.net$/.test(String(to)) ? String(to) : `${to}@s.whatsapp.net`
-    const r = await s.sock.sendMessage(jid, { text })
-    res.json({ ok: true, response: r })
+    const ctx = ensureCtx(req.params.id)
+    if (!ctx.sock) await startSocket(ctx)
+    await ctx.sock.logout()
+    ctx.lastQR = null
+    ctx.pairingCode = null
+    return res.json({ ok: true })
   } catch (e: any) {
-    if (e?.message === "session-not-found") return res.status(503).json({ error: "WhatsApp socket not ready" })
-    res.status(500).json({ error: e?.message || "send failed" })
+    return res.status(500).json({ error: e?.message || "logout failed" })
   }
 })
 
-// ------------------------
-// Lancement serveur
-// ------------------------
-app.listen(PORT, async () => {
+/**
+ * Webhook (enregistrement)
+ * body: { url, secret? }
+ */
+app.post("/sessions/:id/webhook", auth, async (req, res) => {
+  const ctx = ensureCtx(req.params.id)
+  ctx.webhook = { url: String(req.body?.url || ""), secret: req.body?.secret }
+  return res.json({ ok: true })
+})
+
+// -----------------------------
+// RÉTRO-COMPAT (session "default")
+// -----------------------------
+app.get("/qr", auth, async (_req, res) => {
+  const ctx = ensureCtx(DEFAULT_SESSION_ID)
+  if (!ctx.sock) await startSocket(ctx)
+  if (!ctx.lastQR) return res.status(404).json({ error: "no-qr-available" })
+  return res.json({ sessionId: ctx.id, qr: ctx.lastQR })
+})
+
+app.post("/send", auth, async (req, res) => {
+  const ctx = ensureCtx(DEFAULT_SESSION_ID)
+  if (!ctx.sock) await startSocket(ctx)
+  const to = String(req.body?.to || "").trim()
+  const text = String(req.body?.text || "").trim()
+  if (!to || !text) return res.status(400).json({ error: "to & text required" })
+  const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`
+  const r = await ctx.sock.sendMessage(jid, { text })
+  return res.json({ ok: true, id: r?.key?.id })
+})
+
+// -----------------------------
+app.listen(PORT, () => {
   logger.info(`HTTP listening on :${PORT}`)
-  // démarre la session par défaut pour compat (QR via /qr)
-  try {
-    await ensureDir(path.join(DATA_DIR, "sessions"))
-    await startSession(DEFAULT_SESSION_ID)
-  } catch (e) {
-    logger.warn({ err: (e as any)?.message }, "default session start failed")
-  }
+  // démarre la session par défaut pour compat
+  const ctx = ensureCtx(DEFAULT_SESSION_ID)
+  startSocket(ctx, { printQRInTerminal: false }).catch((e) => {
+    logger.warn(e, "default session start failed")
+  })
 })
