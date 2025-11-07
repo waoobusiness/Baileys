@@ -1,367 +1,328 @@
-import express from "express";
-import pino from "pino";
-import path from "node:path";
-import fs from "node:fs/promises";
-import {
-  default as makeWASocket,
-  DisconnectReason,
+import express from 'express'
+import pino from 'pino'
+import path from 'node:path'
+import fs from 'node:fs/promises'
+import makeWASocket, {
   useMultiFileAuthState,
-  Browsers,
-  downloadMediaMessage,
-  WAMessage
-} from "@whiskeysockets/baileys";
+  Browsers
+} from '@vkazee/baileys'
 
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+const PORT = Number(process.env.PORT || 3001)
+const API_KEY = process.env.API_KEY || process.env.GATEWAY_API_KEY || ''
+const DATA_DIR = process.env.DATA_DIR || '/data'
+const AUTH_ROOT = path.join(DATA_DIR, 'auth')
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
 
-/** --------- CONFIG CHEMINS / CLÉ API --------- */
-const DATA_DIR = process.env.DATA_DIR || process.env.RENDER_DISK_PATH || "/data";
-const AUTH_BASE = process.env.AUTH_DIR || path.join(DATA_DIR, "auth_info_baileys");
-const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, "media");
-const PORT = Number(process.env.PORT || 3001);
-const API_KEY = process.env.API_KEY || process.env.GATEWAY_API_KEY || ""; // x-api-key
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 
-/** On s’assure que les dossiers existent */
-await fs.mkdir(DATA_DIR, { recursive: true }).catch(() => {});
-await fs.mkdir(AUTH_BASE, { recursive: true }).catch(() => {});
-await fs.mkdir(MEDIA_DIR, { recursive: true }).catch(() => {});
-// eslint-disable-next-line no-console
-console.log({ DATA_DIR, AUTH_DIR: AUTH_BASE, MEDIA_DIR }, "paths ready");
-
-/** --------- ÉTAT EN MÉMOIRE --------- */
-type Session = {
-  id: string;
-  sock: any;
-  saveCreds: () => Promise<void>;
-  lastQR?: string;
-  qrAt?: number;
-  chats: Map<string, any>;
-  contacts: Map<string, any>;
-  mediaIndex: Map<string, string>; // msgId -> filepath
-};
-
-const sessions = new Map<string, Session>();
-
-/** Auth middleware (sauf /health) */
-function requireApiKey(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (req.path === "/health") return next();
-  const key = req.get("x-api-key") || String(req.query.key || "");
-  if (!API_KEY || key === API_KEY) return next();
-  return res.status(401).json({ error: "unauthorized" });
+type SessionState = {
+  id: string
+  sock: any
+  lastQr?: string
+  lastQrAt?: number
+  connected?: boolean
+  me?: { id?: string; name?: string }
+  counts: { chats: number; contacts: number }
+  knownJids: Set<string>          // alimenté à la volée (messages, updates)
 }
 
-/** Création/obtention d’une session */
-async function ensureSession(sessionId: string): Promise<Session> {
-  const id = sessionId || "default";
-  const exists = sessions.get(id);
-  if (exists) return exists;
+const sessions = new Map<string, SessionState>()
 
-  const authPath = path.join(AUTH_BASE, id);
-  await fs.mkdir(authPath, { recursive: true }).catch(() => {});
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+/** auth simple middleware (sauf /health) */
+function auth(req: any, res: any, next: any) {
+  if (req.path === '/health') return next()
+  const key = req.header('x-api-key') || req.query.key
+  if (!API_KEY || key !== API_KEY) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  return next()
+}
+
+/** crée le dossier s'il n'existe pas */
+async function ensureDir(dir: string) {
+  await fs.mkdir(dir, { recursive: true })
+}
+
+/** Start (or return) a WA socket for sessionId */
+async function startSocket(sessionId: string) {
+  // reuse if already started
+  const current = sessions.get(sessionId)
+  if (current?.sock) {
+    return current
+  }
+
+  const authDir = path.join(AUTH_ROOT, sessionId)
+  await ensureDir(authDir)
+  await ensureDir(MEDIA_DIR)
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir)
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // on remonte le QR via l'event
-    browser: Browsers.ubuntu("Zuria/Render"),
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: true,
+    printQRInTerminal: false,
     markOnlineOnConnect: false,
-    syncFullHistory: true
-  });
+    connectTimeoutMs: 90_000
+  })
 
-  const s: Session = {
-    id,
+  // init
+  const s: SessionState = {
+    id: sessionId,
     sock,
-    saveCreds,
-    chats: new Map(),
-    contacts: new Map(),
-    mediaIndex: new Map()
-  };
-  sessions.set(id, s);
+    lastQr: undefined,
+    lastQrAt: undefined,
+    connected: false,
+    me: undefined,
+    counts: { chats: 0, contacts: 0 },
+    knownJids: new Set<string>()
+  }
+  sessions.set(sessionId, s)
 
-  /** ---------- ÉVÉNEMENTS BAILEYS ---------- */
+  // creds persistence
+  ;(sock.ev as any).on('creds.update', saveCreds)
 
-  // Sauvegarde des credentials (CRITIQUE)
-  sock.ev.on("creds.update", saveCreds);
-
-  // QR & connexion
-  sock.ev.on("connection.update", (up: any) => {
-    const { connection, lastDisconnect, qr } = up || {};
+  // connection lifecycle + QR tracking
+  ;(sock.ev as any).on('connection.update', (u: any) => {
+    const { connection, lastDisconnect, qr } = u || {}
     if (qr) {
-      s.lastQR = qr;
-      s.qrAt = Date.now();
-      logger.info({ sessionId: id, qrAt: s.qrAt }, "QR updated");
+      s.lastQr = qr
+      s.lastQrAt = Date.now()
+      logger.info({ sessionId, qrAt: s.lastQrAt }, 'QR updated')
     }
-    if (connection === "close") {
-      const statusCode = (lastDisconnect as any)?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn({ sessionId: id, statusCode }, "WS closed");
-      if (shouldReconnect) {
-        setTimeout(async () => {
-          try {
-            const restarted = await ensureSession(id);
-            logger.info({ sessionId: restarted.id }, "session restarted");
-          } catch (e) {
-            logger.error({ err: e }, "restart failed");
-          }
-        }, 1500);
-      } else {
-        sessions.delete(id);
+    if (connection === 'open') {
+      s.connected = true
+      s.me = { id: sock?.user?.id, name: sock?.user?.name }
+      logger.info({ sessionId, me: s.me }, 'connection open')
+    }
+    if (connection === 'close') {
+      s.connected = false
+      const code = (lastDisconnect as any)?.error?.output?.statusCode
+      logger.warn({ sessionId, code }, 'connection closed')
+      // ici on NE relance PAS automatiquement: session pilotée par API
+    }
+  })
+
+  // messages: on mémorise juste les jids rencontrés
+  ;(sock.ev as any).on('messages.upsert', (ev: any) => {
+    try {
+      for (const m of ev?.messages || []) {
+        const jid = m?.key?.remoteJid
+        if (jid) s.knownJids.add(jid)
       }
-    }
-    if (connection === "open") {
-      logger.info({ sessionId: id }, "WhatsApp socket OPEN");
-    }
-  });
+    } catch {}
+  })
 
-  // STORE: chats/contacts (cast en any pour éviter l'erreur TS2345)
-  (sock.ev as any).on("chats.set", ({ chats }: any) => {
-    for (const c of chats || []) s.chats.set(String(c.id || c.jid), c);
-  });
-  sock.ev.on("chats.upsert", (up: any) => {
-    for (const c of up || []) s.chats.set(String(c.id || c.jid), c);
-  });
-  sock.ev.on("chats.update", (up: any) => {
-    for (const c of up || []) {
-      const id0 = String(c.id || c.jid);
-      s.chats.set(id0, { ...(s.chats.get(id0) || {}), ...c });
-    }
-  });
+  // contacts/chats counters best-effort (pas de types stricts)
+  ;(sock.ev as any).on('chats.upsert', (ev: any) => {
+    try { s.counts.chats = Math.max(s.counts.chats, (ev?.length || 0)) } catch {}
+  })
+  ;(sock.ev as any).on('contacts.upsert', (ev: any) => {
+    try { s.counts.contacts = Math.max(s.counts.contacts, (ev?.length || 0)) } catch {}
+  })
 
-  (sock.ev as any).on("contacts.set", ({ contacts }: any) => {
-    for (const ct of contacts || []) s.contacts.set(String(ct.id || ct.jid), ct);
-  });
-  sock.ev.on("contacts.upsert", (up: any) => {
-    for (const ct of up || []) s.contacts.set(String(ct.id || ct.jid), ct);
-  });
-  sock.ev.on("contacts.update", (up: any) => {
-    for (const ct of up || []) {
-      const id0 = String(ct.id || ct.jid);
-      s.contacts.set(id0, { ...(s.contacts.get(id0) || {}), ...ct });
-    }
-  });
-
-  // Messages (sauvegarde média avec context reuploadRequest)
-  sock.ev.on("messages.upsert", async (ev: any) => {
-    for (const m of ev.messages as WAMessage[]) {
-      const msgId = m.key.id || `${Date.now()}`;
-      const hasMedia =
-        m.message?.imageMessage ||
-        m.message?.videoMessage ||
-        m.message?.audioMessage ||
-        m.message?.documentMessage ||
-        m.message?.stickerMessage;
-
-      if (hasMedia) {
-        try {
-          const stream = await downloadMediaMessage(
-            m,
-            "stream",
-            {},
-            { reuploadRequest: sock.updateMediaMessage, logger }
-          );
-          const fpath = path.join(MEDIA_DIR, `${msgId}`);
-          const file = await fs.open(fpath, "w");
-          await new Promise<void>((resolve, reject) => {
-            stream.on("data", async (chunk: Buffer) => {
-              await file.write(chunk);
-            });
-            stream.on("end", async () => {
-              await file.close();
-              resolve();
-            });
-            stream.on("error", async (e: any) => {
-              await file.close().catch(() => {});
-              reject(e);
-            });
-          });
-          s.mediaIndex.set(msgId, fpath);
-          logger.info({ sessionId: id, msgId, fpath }, "media saved");
-        } catch (e) {
-          logger.warn({ err: e, sessionId: id }, "media save failed");
-        }
-      }
-    }
-  });
-
-  return s;
+  return s
 }
 
-/** --------- APP HTTP --------- */
-const app = express();
-app.use(express.json({ limit: "5mb" }));
-app.use(requireApiKey);
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-/** Créer / assurer une session */
-app.post("/sessions", async (req, res) => {
-  try {
-    const sessionId = String((req.body?.sessionId || "default")).trim();
-    const s = await ensureSession(sessionId);
-    const connected = Boolean(s.sock?.user);
-    return res.json({
-      ok: true,
-      sessionId: s.id,
-      status: connected ? "connected" : "connecting",
-      isConnected: connected
-    });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "session create failed" });
+/** status payload */
+function sessionStatusPayload(s: SessionState) {
+  return {
+    ok: true,
+    sessionId: s.id,
+    status: s.connected ? 'connected' : 'connecting',
+    isConnected: !!s.connected,
+    me: s.me,
+    phoneNumber: s.me?.id || null,
+    counts: s.counts,
+    qrAvailable: !!s.lastQr
   }
-});
+}
 
-/** Statut session */
-app.get("/sessions/:id", async (req, res) => {
+/** Express app */
+const app = express()
+app.use(express.json({ limit: '2mb' }))
+app.use(auth)
+
+app.get('/health', (_req, res) => res.json({ ok: true }))
+
+/**
+ * POST /sessions
+ * body: { sessionId: string }
+ * -> crée/démarre la session (sans auto-start d'une "default")
+ */
+app.post('/sessions', async (req, res) => {
   try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    const connected = Boolean(s.sock?.user);
-    return res.json({
-      ok: true,
-      sessionId: s.id,
-      status: connected ? "connected" : "connecting",
-      isConnected: connected,
-      me: s.sock?.user || null,
-      phoneNumber: s.sock?.user?.id || null,
-      counts: { chats: s.chats.size, contacts: s.contacts.size },
-      qrAvailable: !connected && !!s.lastQR
-    });
+    const sessionId = String(req.body?.sessionId || '').trim()
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
+
+    const s = await startSocket(sessionId)
+    return res.json(sessionStatusPayload(s))
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "status failed" });
+    logger.error({ err: e }, 'start session failed')
+    return res.status(500).json({ error: e?.message || 'start failed' })
   }
-});
+})
 
-/** QR global (session "default") */
-app.get("/qr", async (_req, res) => {
+/**
+ * GET /sessions/:id
+ * -> statut courant
+ */
+app.get('/sessions/:id', async (req, res) => {
   try {
-    const s = await ensureSession("default");
-    if (!s.lastQR) return res.status(404).json({ error: "no-qr-available" });
-    return res.json({ sessionId: s.id, qr: s.lastQR, qrAt: s.qrAt });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "qr failed" });
-  }
-});
-
-/** QR par session */
-app.get("/sessions/:id/qr", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    if (!s.lastQR) return res.status(404).json({ error: "no-qr-available" });
-    return res.json({ sessionId: s.id, qr: s.lastQR, qrAt: s.qrAt });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "qr failed" });
-  }
-});
-
-/** Pairing code par session */
-app.post("/sessions/:id/pairing-code", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    if (s.sock?.authState?.creds?.registered) {
-      return res.status(400).json({ error: "already-registered" });
-    }
-    const phoneRaw = String(req.body?.phoneNumber || "").replace(/[^\d]/g, "");
-    const custom = String(req.body?.pairing || "").trim(); // optionnel, 8 alphanum
-    if (!phoneRaw) return res.status(400).json({ error: "phoneNumber required" });
-
-    const code = custom && /^[A-Za-z0-9]{8}$/.test(custom)
-      ? await s.sock.requestPairingCode(phoneRaw, custom)
-      : await s.sock.requestPairingCode(phoneRaw);
-
-    return res.json({ sessionId: s.id, pairingCode: code });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "pairing failed" });
-  }
-});
-
-/** Enregistrer un webhook par session (Lovable/Supabase) */
-app.post("/sessions/:id/webhook", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    // Ici on ne pousse pas d’événements ; tu stockes simplement l’URL & secret côté Supabase
-    // et tu consommes nos webhooks « logiques » (messages.upsert, etc.) si tu les ajoutes.
-    return res.json({ ok: true, sessionId: s.id, note: "Per-session webhook accepted (store on your side)" });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "webhook registration failed" });
-  }
-});
-
-/** Liste chats (depuis store mémoire) */
-app.get("/sessions/:id/chats", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    const list = Array.from(s.chats.entries()).map(([id, c]) => ({
-      id,
-      name: (c as any)?.name || (c as any)?.subject || null,
-      unreadCount: (c as any)?.unreadCount || 0,
-      archived: !!(c as any)?.archive
-    }));
-    return res.json({ sessionId: s.id, count: list.length, chats: list });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "chats failed" });
-  }
-});
-
-/** Liste contacts (depuis store mémoire) */
-app.get("/sessions/:id/contacts", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    const list = Array.from(s.contacts.entries()).map(([jid, ct]) => ({
-      jid,
-      name: (ct as any)?.name || null,
-      verifiedName: (ct as any)?.verifiedName || null,
-      isBusiness: !!(ct as any)?.isBusiness,
-      isEnterprise: !!(ct as any)?.isEnterprise
-    }));
-    return res.json({ sessionId: s.id, count: list.length, contacts: list });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "contacts failed" });
-  }
-});
-
-/** URL photo de profil d’un JID */
-app.get("/sessions/:id/profile-picture/:jid", async (req, res) => {
-  try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    const jid = String(req.params.jid);
-    const url = await s.sock.profilePictureUrl(jid, "image");
-    if (!url) return res.status(404).json({ error: "no-profile-picture" });
-    return res.json({ sessionId: s.id, jid, url });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "pp-url failed" });
-  }
-});
-
-/** Télécharger un média par messageId */
-app.get("/media/:messageId", async (req, res) => {
-  try {
-    const messageId = String(req.params.messageId);
-    for (const s of sessions.values()) {
-      const p = s.mediaIndex.get(messageId);
-      if (p) {
-        res.setHeader("Content-Disposition", `inline; filename="${messageId}"`);
-        // @ts-ignore - sendFile est présent au runtime Express
-        return (res as any).sendFile(p);
+    const sessionId = req.params.id
+    let s = sessions.get(sessionId)
+    if (!s) {
+      // ne pas autostart silencieusement; renvoie connecting si auth existe,
+      // ou demande de POST /sessions d’abord
+      const authDir = path.join(AUTH_ROOT, sessionId)
+      try {
+        await fs.access(authDir)
+        // auth existe déjà: on peut démarrer
+        s = await startSocket(sessionId)
+      } catch {
+        return res.json({ ok: true, sessionId, status: 'connecting', isConnected: false, counts: { chats: 0, contacts: 0 }, qrAvailable: false })
       }
     }
-    return res.status(404).json({ error: "media-not-found" });
+    return res.json(sessionStatusPayload(s))
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "media failed" });
+    return res.status(500).json({ error: e?.message || 'status failed' })
   }
-});
+})
 
-/** Envoi rapide (POST JSON: { to, text }) */
-app.post("/sessions/:id/messages/send", async (req, res) => {
+/**
+ * GET /sessions/:id/qr
+ * -> dernier QR émis pour cette session (rafraîchir côté UI toutes les ~2s tant que connecting)
+ */
+app.get('/sessions/:id/qr', async (req, res) => {
   try {
-    const s = await ensureSession(String(req.params.id || "default"));
-    const to = String(req.body?.to || "").replace(/[^\d]/g, "");
-    const text = String(req.body?.text || "");
-    if (!to || !text) return res.status(400).json({ error: "to & text required" });
-    const jid = `${to}@s.whatsapp.net`;
-    const result = await s.sock.sendMessage(jid, { text });
-    return res.json({ ok: true, messageId: result?.key?.id || null });
+    const sessionId = req.params.id
+    const s = sessions.get(sessionId)
+    if (!s) return res.status(404).json({ error: 'session not found' })
+    if (!s.lastQr) return res.status(404).json({ error: 'no-qr-available' })
+    return res.json({ sessionId, qr: s.lastQr, qrAt: s.lastQrAt })
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "send failed" });
+    return res.status(500).json({ error: e?.message || 'qr failed' })
   }
-});
+})
 
-/** Lancement HTTP */
-app.listen(PORT, () => logger.info(`HTTP listening on :${PORT}`));
+/**
+ * POST /sessions/:id/pairing-code
+ * body: { phoneNumber: "4176...", custom?: "AB12C3DE" }
+ * -> génère un code d’appairage (Android “Associer par numéro” uniquement)
+ */
+app.post('/sessions/:id/pairing-code', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const phone = String(req.body?.phoneNumber || '').replace(/\D/g, '')
+    const custom = req.body?.custom ? String(req.body.custom).trim() : undefined
+    if (!phone) return res.status(400).json({ error: 'phoneNumber required (digits only, with country code)' })
+
+    const s = await startSocket(sessionId)
+    if (s.connected || s.sock?.user?.id) {
+      return res.status(409).json({ error: 'already connected' })
+    }
+    const code = await s.sock.requestPairingCode(phone, custom)
+    return res.json({ sessionId, pairingCode: code })
+  } catch (e: any) {
+    logger.error({ err: e }, 'pairing-code failed')
+    return res.status(500).json({ error: e?.message || 'pairing-code failed' })
+  }
+})
+
+/**
+ * POST /sessions/:id/logout
+ */
+app.post('/sessions/:id/logout', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const s = sessions.get(sessionId)
+    if (!s) return res.json({ ok: true, sessionId, message: 'not running' })
+    try { await s.sock?.logout?.() } catch {}
+    s.connected = false
+    s.lastQr = undefined
+    s.lastQrAt = undefined
+    return res.json({ ok: true, sessionId, message: 'logged out' })
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'logout failed' })
+  }
+})
+
+/**
+ * POST /sessions/:id/messages/send
+ * body: { to: "4176...", text?, imageUrl?, videoUrl?, audioUrl?, mimetype? }
+ */
+app.post('/sessions/:id/messages/send', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const s = sessions.get(sessionId)
+    if (!s?.sock) return res.status(503).json({ error: 'session not running' })
+
+    const to = String(req.body?.to || '').replace(/\D/g, '')
+    if (!to) return res.status(400).json({ error: 'to (digits) required' })
+
+    const jid = `${to}@s.whatsapp.net`
+    const { text, imageUrl, videoUrl, audioUrl, mimetype } = req.body || {}
+
+    let content: any = {}
+    if (text) content.text = String(text)
+
+    if (imageUrl) {
+      content.image = { url: String(imageUrl) }
+      if (text) content.caption = String(text)
+    }
+    if (videoUrl) {
+      content.video = { url: String(videoUrl) }
+      if (text) content.caption = String(text)
+    }
+    if (audioUrl) {
+      content.audio = { url: String(audioUrl) }
+      if (mimetype) content.mimetype = String(mimetype)
+    }
+
+    if (!Object.keys(content).length) {
+      return res.status(400).json({ error: 'no message content' })
+    }
+
+    const resp = await s.sock.sendMessage(jid, content)
+    return res.json({ ok: true, sessionId, to: jid, response: resp })
+  } catch (e: any) {
+    logger.error({ err: e }, 'send failed')
+    return res.status(500).json({ error: e?.message || 'send failed' })
+  }
+})
+
+/**
+ * GET /sessions/:id/photo?jid=<jid>
+ * -> URL de photo de profil (si dispo)
+ */
+app.get('/sessions/:id/photo', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const jid = String(req.query.jid || '')
+    const s = sessions.get(sessionId)
+    if (!s?.sock) return res.status(503).json({ error: 'session not running' })
+    if (!jid) return res.status(400).json({ error: 'jid required' })
+    const url = await s.sock.profilePictureUrl(jid, 'image').catch(() => null)
+    return res.json({ ok: true, sessionId, jid, url })
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'photo failed' })
+  }
+})
+
+/**
+ * (optionnel, pour compatibilité tests) GET /qr
+ * -> renvoie le premier QR disponible trouvé parmi les sessions actives
+ */
+app.get('/qr', async (_req, res) => {
+  for (const s of sessions.values()) {
+    if (s.lastQr) return res.json({ sessionId: s.id, qr: s.lastQr, qrAt: s.lastQrAt })
+  }
+  return res.status(404).json({ error: 'no-qr-available' })
+})
+
+/** bootstrap */
+await ensureDir(AUTH_ROOT)
+await ensureDir(MEDIA_DIR)
+logger.info({ DATA_DIR, AUTH_DIR: AUTH_ROOT, MEDIA_DIR }, 'paths ready')
+
+app.listen(PORT, () => logger.info(`HTTP listening on :${PORT}`))
