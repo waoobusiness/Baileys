@@ -48,7 +48,7 @@ const ensureDirs = async () => {
   await fs.mkdir(DATA_DIR, { recursive: true })
   await fs.mkdir(AUTH_BASE, { recursive: true })
   await fs.mkdir(MEDIA_DIR, { recursive: true })
-  logger.info({ DATA_DIR, AUTH_BASE, MEDIA_DIR }, 'paths ready')
+  logger.info({ DATA_DIR, AUTH_DIR: AUTH_BASE, MEDIA_DIR }, 'paths ready')
 }
 
 const sessionDir = (id: string) => path.join(DATA_DIR, 'sessions', id)
@@ -119,14 +119,12 @@ async function postWebhook(sessionId: string, type: string, data: any) {
 /** ================== Helpers ================== */
 function jidToPhone(jid?: string | null) {
   if (!jid) return null
-  // ex: "4176xxxxxxx@s.whatsapp.net"
   return jid.split('@')[0]?.split(':')[0] || null
 }
 
 function extractText(m: WAMessage): string | undefined {
   const msg = m.message
   if (!msg) return
-  // plusieurs variations possibles selon WA
   if ((msg as any).conversation) return (msg as any).conversation
   if ((msg as any).extendedTextMessage?.text) return (msg as any).extendedTextMessage.text
   if ((msg as any).imageMessage?.caption) return (msg as any).imageMessage.caption
@@ -145,11 +143,10 @@ async function startSocket(sessionId: string) {
     browser: Browsers.macOS('Desktop'),
     syncFullHistory: true,
     markOnlineOnConnect: false,
-    printQRInTerminal: false, // QR géré via events
+    printQRInTerminal: false,
     logger,
   })
 
-  // init runtime if absent
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
       sock,
@@ -163,7 +160,6 @@ async function startSocket(sessionId: string) {
 
   await postWebhook(sessionId, 'session:created', {})
 
-  // Events
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', async (u) => {
@@ -174,9 +170,9 @@ async function startSocket(sessionId: string) {
       await postWebhook(sessionId, 'qr:update', { qr: 'AVAILABLE' })
     }
     if (u.connection === 'open') {
-      const me = sock.user || {}
-      s.me = { id: me.id, name: (me as any).name || null }
-      s.phoneNumber = jidToPhone(me.id)
+      const me = sock.user as { id?: string; name?: string } | undefined
+      s.me = { id: me?.id, name: me?.name ?? null }
+      s.phoneNumber = jidToPhone(me?.id)
       await postWebhook(sessionId, 'session:connected', {})
     }
     if (u.connection === 'close') {
@@ -219,11 +215,8 @@ async function ensureSession(sessionId: string) {
 const app = express()
 app.use(express.json())
 
-// Santé
 app.get('/', (_, res) => res.send('ok'))
 app.get('/health', (_, res) => res.json({ ok: true }))
-
-// Auth protégé
 app.use(auth)
 
 /** Créer/assurer session */
@@ -234,7 +227,6 @@ app.post('/sessions', async (req, res) => {
     const s = sessions.get(sessionId)!
     res.json({ ok: true, sessionId, status: s.sock?.user ? 'connected' : 'connecting', isConnected: !!s.sock?.user })
   } catch (e: any) {
-    logger.warn({ err: e?.message }, 'session create failed')
     res.status(500).json({ error: 'session create failed' })
   }
 })
@@ -269,7 +261,7 @@ app.delete('/sessions/:id', async (req, res) => {
       try { await s.sock.logout() } catch {}
     }
     sessions.delete(id)
-    // on peut choisir de purger les creds:
+    // Optional: purge creds
     // await fs.rm(path.join(AUTH_BASE, id), { recursive: true, force: true })
     res.json({ ok: true })
   } catch {
@@ -277,7 +269,7 @@ app.delete('/sessions/:id', async (req, res) => {
   }
 })
 
-/** QR (facile à intégrer côté Lovable) */
+/** QR */
 app.get('/qr', async (req, res) => {
   const sessionId = String(req.query.sessionId || 'default')
   try {
@@ -298,7 +290,6 @@ app.post('/sessions/:id/pairing-code', async (req, res) => {
     if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required (E.164 without +)' })
     const s = await ensureSession(id)
     if (!s.sock) throw new Error('socket not ready')
-    // pairing ne marche que si pas encore enregistré
     if ((s.sock.authState?.creds as any)?.registered) {
       return res.status(400).json({ error: 'already registered; delete session and retry' })
     }
@@ -329,7 +320,7 @@ app.get('/sessions/:id/contacts', async (req, res) => {
   }
 })
 
-/** Photo de contact (si dispo en store) */
+/** Photo de contact */
 app.get('/sessions/:id/contacts/:jid/photo', async (req, res) => {
   try {
     const id = req.params.id
@@ -383,7 +374,7 @@ app.post('/sessions/:id/messages/send', async (req, res) => {
   }
 })
 
-/** ======== NOUVEAU : Webhook par session ======== */
+/** ======== Webhook par session ======== */
 app.post('/sessions/:id/webhook', async (req, res) => {
   try {
     const id = req.params.id
@@ -414,8 +405,6 @@ app.get('/sessions/:id/webhook', async (req, res) => {
 async function main() {
   await ensureDirs()
   app.listen(PORT, () => logger.info(`HTTP listening on :${PORT}`))
-  // Optionnel : démarrer une session par défaut si voulu
-  // await ensureSession('default').catch(err => logger.warn({ err }, 'default session start failed'))
 }
 
 main().catch((e) => {
