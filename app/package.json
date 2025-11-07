@@ -15,6 +15,9 @@
     "express": "^4.19.2",
     "pino": "^9.3.2",
     "qrcode": "^1.5.4"
+		npm i qrcode @whiskeysockets/baileys express cors pino
+npm i -D typescript @types/node @types/express @types/cors @types/qrcode
+
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
