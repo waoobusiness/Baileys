@@ -24,7 +24,8 @@ const API_KEY = process.env.API_KEY || process.env.GATEWAY_API_KEY || ""; // x-a
 await fs.mkdir(DATA_DIR, { recursive: true }).catch(() => {});
 await fs.mkdir(AUTH_BASE, { recursive: true }).catch(() => {});
 await fs.mkdir(MEDIA_DIR, { recursive: true }).catch(() => {});
-logger.info({ DATA_DIR, AUTH_DIR: AUTH_BASE, MEDIA_DIR }, "paths ready");
+// eslint-disable-next-line no-console
+console.log({ DATA_DIR, AUTH_DIR: AUTH_BASE, MEDIA_DIR }, "paths ready");
 
 /** --------- ÉTAT EN MÉMOIRE --------- */
 type Session = {
@@ -78,9 +79,10 @@ async function ensureSession(sessionId: string): Promise<Session> {
 
   /** ---------- ÉVÉNEMENTS BAILEYS ---------- */
 
+  // Sauvegarde des credentials (CRITIQUE)
   sock.ev.on("creds.update", saveCreds);
 
-  // QR
+  // QR & connexion
   sock.ev.on("connection.update", (up: any) => {
     const { connection, lastDisconnect, qr } = up || {};
     if (qr) {
@@ -93,7 +95,6 @@ async function ensureSession(sessionId: string): Promise<Session> {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       logger.warn({ sessionId: id, statusCode }, "WS closed");
       if (shouldReconnect) {
-        // redémarrage soft
         setTimeout(async () => {
           try {
             const restarted = await ensureSession(id);
@@ -111,8 +112,8 @@ async function ensureSession(sessionId: string): Promise<Session> {
     }
   });
 
-  // STORE: chats/contacts
-  sock.ev.on("chats.set", ({ chats }: any) => {
+  // STORE: chats/contacts (cast en any pour éviter l'erreur TS2345)
+  (sock.ev as any).on("chats.set", ({ chats }: any) => {
     for (const c of chats || []) s.chats.set(String(c.id || c.jid), c);
   });
   sock.ev.on("chats.upsert", (up: any) => {
@@ -125,7 +126,7 @@ async function ensureSession(sessionId: string): Promise<Session> {
     }
   });
 
-  sock.ev.on("contacts.set", ({ contacts }: any) => {
+  (sock.ev as any).on("contacts.set", ({ contacts }: any) => {
     for (const ct of contacts || []) s.contacts.set(String(ct.id || ct.jid), ct);
   });
   sock.ev.on("contacts.upsert", (up: any) => {
@@ -138,11 +139,10 @@ async function ensureSession(sessionId: string): Promise<Session> {
     }
   });
 
-  // Messages (save médias)
+  // Messages (sauvegarde média avec context reuploadRequest)
   sock.ev.on("messages.upsert", async (ev: any) => {
     for (const m of ev.messages as WAMessage[]) {
       const msgId = m.key.id || `${Date.now()}`;
-      // si média
       const hasMedia =
         m.message?.imageMessage ||
         m.message?.videoMessage ||
@@ -152,11 +152,16 @@ async function ensureSession(sessionId: string): Promise<Session> {
 
       if (hasMedia) {
         try {
-          const stream = await downloadMediaMessage(m, "stream", {}, { logger });
+          const stream = await downloadMediaMessage(
+            m,
+            "stream",
+            {},
+            { reuploadRequest: sock.updateMediaMessage, logger }
+          );
           const fpath = path.join(MEDIA_DIR, `${msgId}`);
           const file = await fs.open(fpath, "w");
           await new Promise<void>((resolve, reject) => {
-            stream.on("data", async (chunk) => {
+            stream.on("data", async (chunk: Buffer) => {
               await file.write(chunk);
             });
             stream.on("end", async () => {
@@ -271,9 +276,8 @@ app.post("/sessions/:id/pairing-code", async (req, res) => {
 app.post("/sessions/:id/webhook", async (req, res) => {
   try {
     const s = await ensureSession(String(req.params.id || "default"));
-    // Ici, on ne « push » pas les événements ; l’enregistrement est logique côté Supabase.
-    // Tu peux stocker ce webhook par session en DB si tu veux, puis appeler depuis messages.upsert etc.
-    // Pour l’instant on confirme juste.
+    // Ici on ne pousse pas d’événements ; tu stockes simplement l’URL & secret côté Supabase
+    // et tu consommes nos webhooks « logiques » (messages.upsert, etc.) si tu les ajoutes.
     return res.json({ ok: true, sessionId: s.id, note: "Per-session webhook accepted (store on your side)" });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || "webhook registration failed" });
@@ -334,7 +338,8 @@ app.get("/media/:messageId", async (req, res) => {
       const p = s.mediaIndex.get(messageId);
       if (p) {
         res.setHeader("Content-Disposition", `inline; filename="${messageId}"`);
-        return res.sendFile(p);
+        // @ts-ignore - sendFile est présent au runtime Express
+        return (res as any).sendFile(p);
       }
     }
     return res.status(404).json({ error: "media-not-found" });
