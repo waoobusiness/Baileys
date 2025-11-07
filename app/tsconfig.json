@@ -1,14 +1,15 @@
 {
-"compilerOptions": {
-"target": "ES2020",
-"module": "ESNext",
-"moduleResolution": "bundler",
-"outDir": "dist",
-"esModuleInterop": true,
-"forceConsistentCasingInFileNames": true,
-"strict": false,
-"skipLibCheck": true
-},
-"include": ["src/**/*.ts"],
-"exclude": ["node_modules"]
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022"]
+  },
+  "include": ["src/**/*.ts"]
 }
