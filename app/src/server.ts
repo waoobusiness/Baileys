@@ -19,7 +19,13 @@ type SessionState = {
   webhook?: { url: string; secret?: string } | null;
   cache: {
     chats: Array<{ id: string; name?: string; unreadCount?: number }>;
-    contacts: Array<{ jid: string; name?: string; verifiedName?: string | null; isBusiness?: boolean; isEnterprise?: boolean }>;
+    contacts: Array<{
+      jid: string;
+      name?: string;
+      verifiedName?: string | null;
+      isBusiness?: boolean;
+      isEnterprise?: boolean;
+    }>;
   };
 };
 
@@ -40,7 +46,10 @@ async function ensureDirs() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(path.join(DATA_DIR, "auth"), { recursive: true });
   await fs.mkdir(path.join(DATA_DIR, "media"), { recursive: true });
-  logger.info({ DATA_DIR, AUTH_DIR: path.join(DATA_DIR, "auth"), MEDIA_DIR: path.join(DATA_DIR, "media") }, "paths ready");
+  logger.info(
+    { DATA_DIR, AUTH_DIR: path.join(DATA_DIR, "auth"), MEDIA_DIR: path.join(DATA_DIR, "media") },
+    "paths ready"
+  );
 }
 
 const sessions = new Map<string, SessionState>();
@@ -63,7 +72,10 @@ async function createSessionState(id: string): Promise<SessionState> {
   return state;
 }
 
-async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?: { phone: string; customCode?: string } }) {
+async function startSocket(
+  sessionId: string,
+  opts?: { force?: boolean; pairing?: { phone: string } }
+) {
   let state = getSession(sessionId) || (await createSessionState(sessionId));
   if (state.sock && !opts?.force) {
     return state;
@@ -73,10 +85,10 @@ async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?
 
   const sock = makeWASocket({
     auth: authState,
-    printQRInTerminal: false, // on gère nous-mêmes via event
-    browser: Browsers.ubuntu("Zuria/Render", "22.04.4"),
+    printQRInTerminal: false,            // on gère le QR via event
+    browser: Browsers.macOS("Desktop"),  // 1 seul argument (plein historique)
     markOnlineOnConnect: false,
-    syncFullHistory: true // <- important pour récupérer l'historique complet
+    syncFullHistory: true                // récupère un historique plus complet
   });
 
   state.sock = sock;
@@ -99,7 +111,6 @@ async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?
       if (shouldReconnect) {
         setTimeout(() => startSocket(sessionId, { force: true }).catch(() => {}), 1500);
       } else {
-        // logged out -> nettoyer QR
         state.lastQR = undefined;
       }
     }
@@ -114,11 +125,13 @@ async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?
     }
   });
 
-  // Historique (chats/contacts) — on cast en any pour éviter les soucis de typing selon versions
+  // Historique (chats/contacts) — on cast en any pour ignorer les types stricts d’EventMap
   (sock.ev as any).on("chats.set", (ev: any) => {
     try {
       const arr = Array.isArray(ev) ? ev : ev?.chats || [];
-      state.cache.chats = arr.map((c: any) => ({ id: c?.id, name: c?.name, unreadCount: c?.unreadCount })).filter((c: any) => c?.id);
+      state.cache.chats = arr
+        .map((c: any) => ({ id: c?.id, name: c?.name, unreadCount: c?.unreadCount }))
+        .filter((c: any) => c?.id);
     } catch {}
   });
 
@@ -140,7 +153,8 @@ async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?
   // Pairing code si demandé et non enregistré
   if (!sock.authState.creds.registered && opts?.pairing?.phone) {
     try {
-      const pairingCode = await sock.requestPairingCode(opts.pairing.phone, opts.pairing.customCode);
+      // ATTENTION: API officielle prend 1 seul argument (le numéro E.164 SANS '+')
+      const pairingCode: string = await sock.requestPairingCode(opts.pairing.phone);
       logger.info({ sessionId, pairingCode }, "pairing code generated");
     } catch (e) {
       logger.warn({ sessionId, err: (e as Error).message }, "pairing code request failed");
@@ -150,7 +164,6 @@ async function startSocket(sessionId: string, opts?: { force?: boolean; pairing?
   return state;
 }
 
-// Helpers de statut
 function sessionStatusPayload(s: SessionState) {
   const sock = s.sock;
   const isConnected = Boolean(sock?.user);
@@ -174,7 +187,7 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Middleware d'auth
+// Auth middleware (sauf /health)
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   return requireKey(req, res, next);
@@ -184,10 +197,9 @@ app.use((req, res, next) => {
 app.post("/sessions", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || DEFAULT_SESSION_ID);
-    const pairingPhone = req.body?.pairingPhone as string | undefined;
-    const customPair = req.body?.pairingCustomCode as string | undefined;
+    const pairingPhone = (req.body?.pairingPhone as string | undefined)?.replace(/[^\d]/g, "");
 
-    const s = await startSocket(sessionId, pairingPhone ? { pairing: { phone: pairingPhone, customCode: customPair } } : undefined);
+    const s = await startSocket(sessionId, pairingPhone ? { pairing: { phone: pairingPhone } } : undefined);
     return res.json(sessionStatusPayload(s));
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || "create session failed" });
@@ -209,19 +221,18 @@ app.get("/sessions/:id/qr", async (req, res) => {
   return res.status(404).json({ error: "no-qr-available" });
 });
 
-// Pairing code pour une session
+// Pairing code (1 seul argument pris en charge par la lib officielle)
 app.post("/sessions/:id/pairing-code", async (req, res) => {
   try {
     const id = String(req.params.id);
     const phone = String(req.body?.phoneNumber || "").replace(/[^\d]/g, "");
-    const custom = req.body?.customCode as string | undefined;
     if (!phone) return res.status(400).json({ error: "phoneNumber required (E.164 without +)" });
 
     const s = getSession(id) || (await startSocket(id));
     if (!s.sock) return res.status(503).json({ error: "socket not ready" });
     if (s.sock.authState.creds.registered) return res.status(409).json({ error: "already-registered" });
 
-    const code = await s.sock.requestPairingCode(phone, custom);
+    const code: string = await s.sock.requestPairingCode(phone);
     return res.json({ sessionId: id, pairingCode: code });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || "pairing-code failed" });
@@ -242,7 +253,7 @@ app.post("/sessions/:id/logout", async (req, res) => {
   }
 });
 
-// Webhook par session (enregistrement)
+// Webhook par session (enregistrement, persistant côté gateway)
 app.post("/sessions/:id/webhook", async (req, res) => {
   const id = String(req.params.id);
   const { webhookUrl, secret } = req.body || {};
@@ -266,7 +277,7 @@ app.get("/sessions/:id/chats", async (req, res) => {
   return res.json({ sessionId: id, count: s.cache.chats.length, chats: s.cache.chats });
 });
 
-// Raccourcis : QR par défaut
+// Raccourci : QR de la session par défaut
 app.get("/qr", async (req, res) => {
   const s = getSession(DEFAULT_SESSION_ID) || (await startSocket(DEFAULT_SESSION_ID));
   if (s.lastQR?.qr) return res.json({ sessionId: s.id, qr: s.lastQR.qr, qrAt: s.lastQR.at });
@@ -276,7 +287,6 @@ app.get("/qr", async (req, res) => {
 // Boot
 (async () => {
   await ensureDirs();
-  // Optionnel : démarrer la session par défaut au boot
   await startSocket(DEFAULT_SESSION_ID).catch((err) => {
     logger.warn({ err }, "default session start failed");
   });
