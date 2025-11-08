@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: zuria-wa
+    env: node
+    plan: starter
+    buildCommand: "npm install && npm run build"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: LOG_LEVEL
+        value: info
+      # Optionnel: Proxy résidentiel pour éviter les erreurs 515
+      # - key: WS_PROXY_URL
+      #   value: "http://user:pass@host:port"
+    disk:
+      name: wa-data
+      mountPath: /data
+      sizeGB: 1
