@@ -19,13 +19,10 @@ import {
 const log = pino({ level: process.env.LOG_LEVEL || 'info' })
 const API_KEY = process.env.API_KEY || 'dev-key'
 
-// Dossier persistant (Render: ajoute un disque persistant monté sur /data)
 const DATA_DIR = process.env.DATA_DIR || '/data'
 const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
 
-// Proxy résidentiel (facultatif) pour sortir la WebSocket via une IP “home”
-// Ex: http://user:pass@host:port
 const WS_PROXY_URL = process.env.WS_PROXY_URL || ''
 
 /* ========= types & state ========= */
@@ -60,6 +57,17 @@ const ensureSessionRec = (id: string): SessionRec => {
   return rec
 }
 
+/** Abonne un handler et le désabonne via le retour cleanup */
+function subscribeConnectionUpdate(sock: WASocket, cb: (u: any) => void) {
+  const handler = (u: any) => cb(u)
+  // @ts-ignore types de l'EventEmitter Baileys
+  sock.ev.on('connection.update', handler)
+  return () => {
+    // @ts-ignore
+    sock.ev.off('connection.update', handler)
+  }
+}
+
 function onceWithTimeout<T>(
   subscribe: (cb: (v: T) => void) => () => void,
   pred: (v: T) => boolean,
@@ -67,19 +75,19 @@ function onceWithTimeout<T>(
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let done = false
-    const off = subscribe((v) => {
+    const cleanup = subscribe((v) => {
       if (done) return
       if (pred(v)) {
         done = true
         clearTimeout(t)
-        off()
+        cleanup()
         resolve(v)
       }
     })
     const t = setTimeout(() => {
       if (done) return
       done = true
-      off()
+      cleanup()
       reject(new Error('timeout'))
     }, ms)
   })
@@ -91,7 +99,6 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   const rec = ensureSessionRec(sessionId)
   if (rec.sock) return rec
 
-  // auth dir per session
   const authPath = path.join(AUTH_DIR, sessionId)
   await fs.mkdir(authPath, { recursive: true })
   await fs.mkdir(MEDIA_DIR, { recursive: true })
@@ -99,27 +106,26 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
 
-  // Proxy WebSocket (très utile contre code 515)
   const agent = WS_PROXY_URL ? new HttpsProxyAgent(WS_PROXY_URL) : undefined
 
+  // NB: on caste en any pour accepter connectOptions malgré le typage actuel
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: Browsers.macOS('Desktop'), // desktop = syncFullHistory possible
+    browser: Browsers.macOS('Desktop'),
     syncFullHistory: true,
     markOnlineOnConnect: false,
     connectTimeoutMs: 60_000,
-    // ws options
-    connectOptions: agent ? { agent } : {}
-  })
+    ...(agent ? { connectOptions: { agent } } : {})
+  } as any)
 
   rec.sock = sock
   rec.status = 'connecting'
   rec.phone = null
   rec.lastQR = null
 
-  // Sauvegarde des creds — debounce simple
+  // Debounce simple pour saveCreds
   let saving = false
   sock.ev.on('creds.update', async () => {
     if (saving) return
@@ -133,7 +139,6 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
     }
   })
 
-  // QR, open/close, restartRequired
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u
     if (qr) {
@@ -150,20 +155,14 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
 
       rec.status = 'close'
       rec.phone = null
-
       log.warn({ sessionId, code, reason }, 'session closed')
 
-      // WhatsApp force un restart après appairage (DisconnectReason.restartRequired)
       if (code === DisconnectReason.restartRequired && !rec.restarting) {
         rec.restarting = true
         setTimeout(async () => {
-          try {
-            // on détruit l’instance
-            try { await rec.sock?.logout() } catch {}
-          } finally {
+          try { try { await rec.sock?.logout() } catch {} } finally {
             rec.sock = undefined
             rec.restarting = false
-            // on relance
             await startSocket(sessionId)
           }
         }, 1500)
@@ -267,7 +266,7 @@ async function main() {
     return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
   })
 
-  // pairing code — on attend “connecting” ou un QR avant de demander le code
+  // pairing code — attendre la fenêtre "connecting/qr"
   app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
     try {
       const id = req.params.id
@@ -277,26 +276,18 @@ async function main() {
       const rec = await startSocket(id)
       const sock = rec.sock!
 
-      // Si déjà enregistré, inutile
       // @ts-ignore
       if (sock.authState?.creds?.registered) {
         return res.status(400).json({ error: 'already-registered' })
       }
 
-      // Attendre la “fenêtre” de pairing (connecting/qr) pour être conforme aux bonnes pratiques
       await onceWithTimeout(
-        (cb) => {
-          const off = sock.ev.on('connection.update', (u) => {
-            // “connecting” ou réception d’un QR = OK pour demander le pairing code
-            if (u.connection === 'connecting' || !!u.qr) cb(u as any)
-          })
-          return () => sock.ev.off('connection.update', off)
-        },
-        () => true,
+        (cb) => subscribeConnectionUpdate(sock, cb as any),
+        // ok dès qu'on voit "connecting" ou un qr
+        (u: any) => u?.connection === 'connecting' || !!u?.qr,
         20000
       )
 
-      // Certaines versions exposent requestPairingCode sur le socket
       // @ts-ignore
       if (typeof sock.requestPairingCode !== 'function') {
         return res.status(501).json({ error: 'pairing-code-not-supported' })
@@ -322,7 +313,6 @@ async function main() {
   app.listen(PORT, () => {
     log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
     log.info(`HTTP listening on :${PORT}`)
-    // compat : bootstrap session "default"
     startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
   })
 }
