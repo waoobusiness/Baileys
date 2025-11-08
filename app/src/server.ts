@@ -59,14 +59,19 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: true,
-    markOnlineOnConnect: false
-  })
+const sock = makeWASocket({
+  version,
+  auth: state,
+  printQRInTerminal: false,
+  // fingerprint plus "passe-partout"
+  browser: Browsers.ubuntu('Chrome'), // ou Browsers.windows('Chrome')
+  // éviter les transferts volumineux pendant l’appairage
+  syncFullHistory: false,
+  markOnlineOnConnect: false,
+  // timeouts un peu plus généreux après l’appairage
+  connectTimeoutMs: 60_000,
+  defaultQueryTimeoutMs: 60_000
+})
 
   rec.sock = sock
   rec.status = 'connecting'
