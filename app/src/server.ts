@@ -5,6 +5,7 @@ import path from 'node:path'
 import fs from 'node:fs/promises'
 import QRCode from 'qrcode'
 import { HttpsProxyAgent } from 'https-proxy-agent'
+import crypto from 'node:crypto'
 import {
   default as makeWASocket,
   useMultiFileAuthState,
@@ -22,10 +23,13 @@ const API_KEY = process.env.API_KEY || 'dev-key'
 const DATA_DIR = process.env.DATA_DIR || '/data'
 const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
+const HOOK_DIR = process.env.HOOK_DIR || path.join(DATA_DIR, 'hooks')
 
 const WS_PROXY_URL = process.env.WS_PROXY_URL || ''
 
 /* ========= types & state ========= */
+
+type HookCfg = { url: string; secret: string }
 
 type SessionRec = {
   id: string
@@ -35,6 +39,7 @@ type SessionRec = {
   lastQR?: { qr: string; ts: number } | null
   savingCreds?: boolean
   restarting?: boolean
+  hook?: HookCfg | null
 }
 
 const sessions = new Map<string, SessionRec>()
@@ -51,13 +56,35 @@ const authz: express.RequestHandler = (req, res, next) => {
 const ensureSessionRec = (id: string): SessionRec => {
   let rec = sessions.get(id)
   if (!rec) {
-    rec = { id, status: 'close', phone: null, lastQR: null }
+    rec = { id, status: 'close', phone: null, lastQR: null, hook: null }
     sessions.set(id, rec)
   }
   return rec
 }
 
-/** crée un agent proxy uniquement si l’URL est valide et http/https */
+async function readHook(sessionId: string): Promise<HookCfg | null> {
+  try {
+    const file = path.join(HOOK_DIR, `${sessionId}.json`)
+    const raw = await fs.readFile(file, 'utf8')
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+async function writeHook(sessionId: string, cfg: HookCfg | null) {
+  const file = path.join(HOOK_DIR, `${sessionId}.json`)
+  if (!cfg) {
+    try { await fs.unlink(file) } catch {}
+    const rec = ensureSessionRec(sessionId)
+    rec.hook = null
+    return
+  }
+  await fs.mkdir(HOOK_DIR, { recursive: true })
+  await fs.writeFile(file, JSON.stringify(cfg), 'utf8')
+  const rec = ensureSessionRec(sessionId)
+  rec.hook = cfg
+}
+
 function makeProxyAgent(url: string | undefined) {
   if (!url) return undefined
   try {
@@ -73,40 +100,42 @@ function makeProxyAgent(url: string | undefined) {
   }
 }
 
-/** Abonne un handler et le désabonne via le retour cleanup */
-function subscribeConnectionUpdate(sock: WASocket, cb: (u: any) => void) {
-  const handler = (u: any) => cb(u)
-  // @ts-ignore EventEmitter de Baileys
-  sock.ev.on('connection.update', handler)
-  return () => {
-    // @ts-ignore
-    sock.ev.off('connection.update', handler)
-  }
+function hmacHex(secret: string, body: string) {
+  return crypto.createHmac('sha256', secret).update(body).digest('hex')
 }
 
-function onceWithTimeout<T>(
-  subscribe: (cb: (v: T) => void) => () => void,
-  pred: (v: T) => boolean,
-  ms = 20000
-): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    let done = false
-    const cleanup = subscribe((v) => {
-      if (done) return
-      if (pred(v)) {
-        done = true
-        clearTimeout(t)
-        cleanup()
-        resolve(v)
-      }
+async function forwardToWebhook(sessionId: string, type: string, payload: any) {
+  const rec = ensureSessionRec(sessionId)
+  const hook = rec.hook || (rec.hook = await readHook(sessionId))
+  if (!hook) return
+
+  const event = {
+    session_id: sessionId,
+    phone_number: rec.phone || null,
+    event_type: type,
+    payload,
+    ts: Date.now()
+  }
+  const body = JSON.stringify(event)
+  const sig = hmacHex(hook.secret, body)
+
+  try {
+    const rsp = await fetch(hook.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-zuria-session-id': sessionId,
+        'x-zuria-signature': sig
+      },
+      body
     })
-    const t = setTimeout(() => {
-      if (done) return
-      done = true
-      cleanup()
-      reject(new Error('timeout'))
-    }, ms)
-  })
+    if (!rsp.ok) {
+      const txt = await rsp.text().catch(() => '')
+      log.warn({ sessionId, status: rsp.status, txt }, 'webhook responded non-200')
+    }
+  } catch (err) {
+    log.warn({ sessionId, err }, 'webhook forward failed')
+  }
 }
 
 /* ========= socket lifecycle ========= */
@@ -121,10 +150,8 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
 
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
-
   const agent = makeProxyAgent(WS_PROXY_URL)
 
-  // NB: cast en any pour autoriser connectOptions selon les versions
   const sock = makeWASocket({
     version,
     auth: state,
@@ -141,7 +168,7 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   rec.phone = null
   rec.lastQR = null
 
-  // Debounce saveCreds
+  // creds
   let saving = false
   sock.ev.on('creds.update', async () => {
     if (saving) return
@@ -155,15 +182,20 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
     }
   })
 
+  // connection updates
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u
     if (qr) {
       rec.lastQR = { qr, ts: Date.now() }
+      // On peut forward l'info QR si tu veux monitorer côté backend
+      forwardToWebhook(sessionId, 'qr.update', { qrAt: rec.lastQR.ts }).catch(() => {})
     }
+
     if (connection === 'open') {
       rec.status = 'open'
       rec.phone = sock.user?.id || null
       log.info({ sessionId, phone: rec.phone }, 'session connected')
+      forwardToWebhook(sessionId, 'session.connected', { phone: rec.phone }).catch(() => {})
     } else if (connection === 'close') {
       const boom: any = lastDisconnect?.error
       const code = boom?.output?.statusCode
@@ -172,6 +204,7 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
       rec.status = 'close'
       rec.phone = null
       log.warn({ sessionId, code, reason }, 'session closed')
+      forwardToWebhook(sessionId, 'session.closed', { code, reason }).catch(() => {})
 
       if (code === DisconnectReason.restartRequired && !rec.restarting) {
         rec.restarting = true
@@ -188,6 +221,31 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
     }
   })
 
+  // messages
+  sock.ev.on('messages.upsert', (m) => {
+    forwardToWebhook(sessionId, 'messages.upsert', m).catch(() => {})
+  })
+  sock.ev.on('messages.update', (m) => {
+    forwardToWebhook(sessionId, 'messages.update', m).catch(() => {})
+  })
+  sock.ev.on('messages.reaction', (m) => {
+    forwardToWebhook(sessionId, 'messages.reaction', m).catch(() => {})
+  })
+
+  // contacts & chats (optionnel mais utile)
+  sock.ev.on('contacts.upsert', (c) => {
+    forwardToWebhook(sessionId, 'contacts.upsert', c).catch(() => {})
+  })
+  sock.ev.on('contacts.update', (c) => {
+    forwardToWebhook(sessionId, 'contacts.update', c).catch(() => {})
+  })
+  sock.ev.on('chats.upsert', (c) => {
+    forwardToWebhook(sessionId, 'chats.upsert', c).catch(() => {})
+  })
+  sock.ev.on('chats.update', (c) => {
+    forwardToWebhook(sessionId, 'chats.update', c).catch(() => {})
+  })
+
   return rec
 }
 
@@ -197,6 +255,7 @@ async function logoutSession(sessionId: string) {
     try { await rec.sock.logout() } catch {}
   }
   sessions.delete(sessionId)
+  try { await writeHook(sessionId, null) } catch {}
 }
 
 /* ========= HTTP server ========= */
@@ -205,6 +264,7 @@ async function main() {
   await fs.mkdir(DATA_DIR, { recursive: true })
   await fs.mkdir(AUTH_DIR, { recursive: true })
   await fs.mkdir(MEDIA_DIR, { recursive: true })
+  await fs.mkdir(HOOK_DIR, { recursive: true })
 
   const app = express()
   app.use(cors())
@@ -249,7 +309,7 @@ async function main() {
     })
   })
 
-  // per-session QR (JSON)
+  // per-session QR
   app.get('/sessions/:id/qr', authz, (req, res) => {
     const id = req.params.id
     const rec = ensureSessionRec(id)
@@ -257,8 +317,6 @@ async function main() {
     if (!entry) return res.status(404).json({ error: 'no-qr-available', sessionId: id })
     return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
   })
-
-  // per-session QR (PNG)
   app.get('/sessions/:id/qr.png', authz, async (req, res) => {
     const id = req.params.id
     const rec = ensureSessionRec(id)
@@ -272,14 +330,42 @@ async function main() {
       return res.status(500).json({ error: e?.message || 'qr-png-failed' })
     }
   })
-
-  // global QR (compat) pour "default"
+  // compat pour "default"
   app.get('/qr', authz, (_req, res) => {
     const id = 'default'
     const rec = ensureSessionRec(id)
     const entry = rec.lastQR && (Date.now() - rec.lastQR.ts < QR_TTL_MS) ? rec.lastQR : null
     if (!entry) return res.status(404).json({ error: 'no-qr-available', sessionId: id })
     return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
+  })
+
+  // register per-session webhook
+  app.post('/sessions/:id/webhook', authz, async (req, res) => {
+    const id = req.params.id
+    const { url, secret } = req.body || {}
+    if (!url || !secret) return res.status(400).json({ error: 'url & secret required' })
+    try {
+      // validate URL
+      new URL(url)
+      await writeHook(id, { url, secret })
+      // envoie un test
+      await forwardToWebhook(id, 'webhook.test', { ok: true })
+      return res.json({ ok: true, sessionId: id })
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || 'invalid-webhook' })
+    }
+  })
+
+  app.get('/sessions/:id/webhook', authz, async (req, res) => {
+    const id = req.params.id
+    const cfg = (ensureSessionRec(id).hook) || await readHook(id)
+    return res.json({ ok: true, sessionId: id, hasWebhook: !!cfg })
+  })
+
+  app.delete('/sessions/:id/webhook', authz, async (req, res) => {
+    const id = req.params.id
+    await writeHook(id, null)
+    return res.json({ ok: true, sessionId: id })
   })
 
   // pairing code
@@ -296,12 +382,6 @@ async function main() {
       if (sock.authState?.creds?.registered) {
         return res.status(400).json({ error: 'already-registered' })
       }
-
-      await onceWithTimeout(
-        (cb) => subscribeConnectionUpdate(sock, cb as any),
-        (u: any) => u?.connection === 'connecting' || !!u?.qr,
-        20000
-      )
 
       // @ts-ignore
       if (typeof sock.requestPairingCode !== 'function') {
@@ -326,7 +406,7 @@ async function main() {
 
   const PORT = Number(process.env.PORT || 3001)
   app.listen(PORT, () => {
-    log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
+    log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR, HOOK_DIR }, 'paths ready')
     log.info(`HTTP listening on :${PORT}`)
     startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
   })
