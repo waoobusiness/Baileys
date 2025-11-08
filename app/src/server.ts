@@ -17,12 +17,12 @@ import { HttpsProxyAgent } from 'https-proxy-agent'
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' })
 
-const API_KEY  = process.env.API_KEY  || 'dev-key'
-const DATA_DIR = process.env.DATA_DIR || '/data'
-const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
+const API_KEY   = process.env.API_KEY  || 'dev-key'
+const DATA_DIR  = process.env.DATA_DIR || '/data'
+const AUTH_DIR  = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
 
-// assure les dossiers (sync pour éviter top-level await)
+// évite top-level await : crée les dossiers en sync
 for (const p of [DATA_DIR, AUTH_DIR, MEDIA_DIR]) {
   try { fs.mkdirSync(p, { recursive: true }) } catch {}
 }
@@ -68,8 +68,8 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
 
-  // Proxy résidentiel optionnel (HTTPS_PROXY ou HTTP_PROXY)
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY
+  // ⚠️ Proxy pour la websocket WhatsApp: utiliser WS_PROXY_URL (pas HTTPS_PROXY)
+  const proxyUrl = process.env.WS_PROXY_URL
   const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined
 
   const sock = makeWASocket({
@@ -77,12 +77,10 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
     auth: state,
     printQRInTerminal: false,
     browser: Browsers.ubuntu('Chrome'),
-    // IMPORTANT : d'abord false pour éviter des rejets pendant le 1er lien
-    syncFullHistory: false,
+    syncFullHistory: false,           // activera après login si besoin
     markOnlineOnConnect: false,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
-    // route la websocket via proxy si fourni
     agent
   })
 
@@ -99,7 +97,6 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
 
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u
-
     if (qr) rec.lastQR = { qr, ts: Date.now() }
 
     if (connection === 'open') {
@@ -107,7 +104,6 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
       rec.phone = sock.user?.id || null
       log.info({ sessionId, phone: rec.phone }, 'session connected')
     } else if (connection === 'close') {
-      // extrait au mieux la raison (inclut stream:error 515)
       const err = (lastDisconnect as any)?.error
       let reason =
         err?.output?.payload?.message ||
@@ -142,7 +138,7 @@ app.use(express.json())
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// créer / assurer la session (idempotent)
+// créer / assurer une session
 app.post('/sessions', authz, async (req, res) => {
   try {
     const id = String(req.body?.sessionId || '').trim()
@@ -163,7 +159,7 @@ app.post('/sessions', authz, async (req, res) => {
   }
 })
 
-// statut session
+// statut
 app.get('/sessions/:id', authz, (req, res) => {
   const id = req.params.id
   const rec = ensureSessionRec(id)
@@ -188,7 +184,7 @@ app.get('/sessions/:id/qr', authz, (req, res) => {
   return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
 })
 
-// QR (PNG) — pratique pour <img>
+// QR (PNG)
 app.get('/sessions/:id/qr.png', authz, async (req, res) => {
   const id = req.params.id
   const rec = ensureSessionRec(id)
@@ -212,7 +208,7 @@ app.get('/qr', authz, (_req, res) => {
   return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
 })
 
-// pairing-code (si dispo dans la lib)
+// pairing-code (si la lib l’expose)
 app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
   try {
     const id = req.params.id
@@ -232,14 +228,14 @@ app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
   }
 })
 
-// logout (conserve les fichiers)
+// logout
 app.post('/sessions/:id/logout', authz, async (req, res) => {
   const id = req.params.id
   await logoutSession(id)
   return res.json({ ok: true, sessionId: id, status: 'disconnected' })
 })
 
-// reset total: supprime les creds disque
+// reset total
 app.delete('/sessions/:id', authz, async (req, res) => {
   const id = req.params.id
   await logoutSession(id)
@@ -251,6 +247,5 @@ const PORT = Number(process.env.PORT || 3001)
 app.listen(PORT, () => {
   log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
   log.info(`HTTP listening on :${PORT}`)
-  // Boot auto de "default" pour compat
   startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
 })
