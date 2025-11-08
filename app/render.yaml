@@ -13,9 +13,9 @@ services:
         value: /data
       - key: LOG_LEVEL
         value: info
-      # Optionnel: Proxy résidentiel pour éviter les erreurs 515
+      # Ne mets WS_PROXY_URL que si tu as un vrai proxy HTTP/HTTPS !
       # - key: WS_PROXY_URL
-      #   value: "http://user:pass@host:port"
+      #   value: "http://user:pass@proxy.example.com:8080"
     disk:
       name: wa-data
       mountPath: /data
