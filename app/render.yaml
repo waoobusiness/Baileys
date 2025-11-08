@@ -13,7 +13,7 @@ services:
         value: /data
       - key: LOG_LEVEL
         value: info
-      # Ne mets WS_PROXY_URL que si tu as un vrai proxy HTTP/HTTPS !
+      # Décommente uniquement si tu as un vrai proxy HTTP/HTTPS
       # - key: WS_PROXY_URL
       #   value: "http://user:pass@proxy.example.com:8080"
     disk:
