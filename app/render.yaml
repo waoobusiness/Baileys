@@ -3,19 +3,26 @@ services:
     name: zuria-wa
     env: node
     plan: starter
-    buildCommand: "npm install && npm run build"
-    startCommand: "npm start"
     autoDeploy: true
+    buildCommand: npm install && npm run build
+    startCommand: npm start
     envVars:
+      - key: NODE_VERSION
+        value: 20.19.5
       - key: API_KEY
-        sync: false
-      - key: DATA_DIR
-        value: /data
+        sync: false         # mets ta clé privée
+      - key: PUBLIC_BASE_URL
+        value: https://zuria-wa.onrender.com
       - key: LOG_LEVEL
         value: info
-      # Décommente uniquement si tu as un vrai proxy HTTP/HTTPS
-      # - key: WS_PROXY_URL
-      #   value: "http://user:pass@proxy.example.com:8080"
+      - key: DATA_DIR
+        value: /data
+      - key: AUTH_DIR
+        value: /data/auth_info_baileys
+      - key: MEDIA_DIR
+        value: /data/media
+      - key: TZ
+        value: UTC
     disk:
       name: wa-data
       mountPath: /data
