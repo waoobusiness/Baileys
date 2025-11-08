@@ -40,7 +40,7 @@ const authz: express.RequestHandler = (req, res, next) => {
   next()
 }
 
-/* ========= simple in-memory store (no makeInMemoryStore) ========= */
+/* ========= simple in-memory store ========= */
 
 type Contact = Record<string, any>
 type Chat = Record<string, any>
@@ -64,10 +64,9 @@ type SessionRec = {
   lastQR?: { qr: string; ts: number } | null
   savingCreds?: boolean
 
-  // mini store
   contacts: Map<string, Contact>
   chats: Map<string, Chat>
-  messages: Map<string, WAMessage[]>  // per jid (keep ~500)
+  messages: Map<string, WAMessage[]>
   mediaIndex: Map<string, MediaMeta>
   webhook?: string | null
 }
@@ -95,7 +94,6 @@ function ensureSessionRec(id: string): SessionRec {
 
 function unwrapMsgContent(m: WAMessage) {
   const msg = m.message || {}
-  // handle viewOnce container
   if ((msg as any).viewOnceMessage?.message) return (msg as any).viewOnceMessage.message
   return msg
 }
@@ -177,7 +175,6 @@ async function pushWebhook(rec: SessionRec, m: WAMessage) {
     } : null
   }
 
-  // fire and forget
   fetch(rec.webhook, {
     method: 'POST',
     headers: { 'content-type':'application/json' },
@@ -218,25 +215,25 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
     try { await saveCreds() } finally { rec.savingCreds = false }
   })
 
-  // contacts/chats snapshot & updates
-  sock.ev.on('contacts.set', ({ contacts }) => {
+  // contacts/chats — cast en any pour contourner le mismatch de typings
+  ;(sock.ev as any).on('contacts.set', ({ contacts }: any) => {
     rec.contacts.clear()
     for (const [id, v] of Object.entries(contacts)) rec.contacts.set(id, v as Contact)
   })
-  sock.ev.on('contacts.upsert', (arr) => {
+  ;(sock.ev as any).on('contacts.upsert', (arr: any[]) => {
     for (const c of arr) {
       const prev = rec.contacts.get(c.id) || {}
       rec.contacts.set(c.id, { ...prev, ...c })
     }
   })
-  sock.ev.on('chats.set', ({ chats }) => {
+  ;(sock.ev as any).on('chats.set', ({ chats }: any) => {
     rec.chats.clear()
     for (const c of chats) rec.chats.set(c.id, c as Chat)
   })
-  sock.ev.on('chats.upsert', (arr) => {
+  sock.ev.on('chats.upsert', (arr: any[]) => {
     for (const c of arr) rec.chats.set(c.id, c as Chat)
   })
-  sock.ev.on('chats.update', (arr) => {
+  sock.ev.on('chats.update', (arr: any[]) => {
     for (const upd of arr) {
       const prev = rec.chats.get(upd.id) || {}
       rec.chats.set(upd.id, { ...prev, ...upd })
@@ -372,7 +369,7 @@ app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
 
     const rec = await startSocket(id)
     const sock = rec.sock!
-    // @ts-ignore – certaines versions exposent requestPairingCode
+    // @ts-ignore (exposé selon versions)
     if (typeof sock.requestPairingCode !== 'function') {
       return res.status(501).json({ error: 'pairing-code-not-supported' })
     }
@@ -415,19 +412,18 @@ app.get('/sessions/:id/profile-picture', authz, async (req, res) => {
   }
 })
 
-/* ===== messages recent + history ===== */
+/* ===== messages ===== */
 app.get('/sessions/:id/messages/recent', authz, async (req, res) => {
   const rec = ensureSessionRec(req.params.id)
   const jid = String(req.query.jid || '')
   const count = Math.max(1, Math.min(100, Number(req.query.count || 25)))
   if (!jid) return res.status(400).json({ error: 'jid required' })
   const list = rec.messages.get(jid) || []
-  // return last N by timestamp
   const sorted = [...list].sort((a,b) => Number(a.messageTimestamp||0) - Number(b.messageTimestamp||0))
   res.json({ ok:true, jid, messages: sorted.slice(-count) })
 })
 
-// naive history fetch (needs an anchor message already in memory)
+// naive history fetch (anchor-based)
 app.get('/sessions/:id/messages/history', authz, async (req, res) => {
   const rec = ensureSessionRec(req.params.id)
   const jid = String(req.query.jid || '')
@@ -438,9 +434,8 @@ app.get('/sessions/:id/messages/history', authz, async (req, res) => {
   const oldest = [...have].sort((a,b) => Number(a.messageTimestamp||0) - Number(b.messageTimestamp||0))[0]
   if (!oldest) return res.status(404).json({ error: 'no-anchor' })
   try {
-    // @ts-ignore – Baileys expose cette méthode dans la version Vkazee/doc
+    // @ts-ignore — selon version
     await rec.sock!.fetchMessageHistory(count, oldest.key, oldest.messageTimestamp)
-    // nouveaux messages arriveront via messages.upsert
     res.json({ ok:true, requested: count })
   } catch (e:any) {
     res.status(500).json({ error: e?.message || 'history-fetch-failed' })
@@ -452,7 +447,6 @@ app.get('/sessions/:id/media/:messageId.bin', authz, async (req, res) => {
   const rec = ensureSessionRec(req.params.id)
   const mid = req.params.messageId
 
-  // search across cached messages
   let found: WAMessage | undefined
   for (const [, arr] of rec.messages) {
     const hit = arr.find(x => x.key.id === mid)
@@ -509,7 +503,7 @@ async function boot() {
   app.listen(PORT, () => {
     log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
     log.info(`HTTP listening on :${PORT}`)
-    // start default session for /qr compat
+    // démarrage de la session 'default' pour compat /qr
     startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
   })
 }
