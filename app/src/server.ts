@@ -1,9 +1,8 @@
-// src/server.ts
 import express from 'express'
 import cors from 'cors'
 import pino from 'pino'
 import path from 'node:path'
-import fs from 'node:fs/promises'
+import fs from 'node:fs'
 import QRCode from 'qrcode'
 import {
   default as makeWASocket,
@@ -12,14 +11,21 @@ import {
   Browsers,
   type WASocket
 } from '@whiskeysockets/baileys'
+import { HttpsProxyAgent } from 'https-proxy-agent'
 
-/* ========= config & helpers ========= */
+/* ========= config ========= */
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' })
-const API_KEY   = process.env.API_KEY   || 'dev-key'
-const DATA_DIR  = process.env.DATA_DIR  || '/data'
-const AUTH_DIR  = process.env.AUTH_DIR  || path.join(DATA_DIR, 'auth')
+
+const API_KEY  = process.env.API_KEY  || 'dev-key'
+const DATA_DIR = process.env.DATA_DIR || '/data'
+const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
+
+// assure les dossiers (sync pour éviter top-level await)
+for (const p of [DATA_DIR, AUTH_DIR, MEDIA_DIR]) {
+  try { fs.mkdirSync(p, { recursive: true }) } catch {}
+}
 
 type SessionRec = {
   id: string
@@ -32,6 +38,8 @@ type SessionRec = {
 
 const sessions = new Map<string, SessionRec>()
 const QR_TTL_MS = 90_000
+
+/* ========= helpers ========= */
 
 const authz = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const key = req.get('x-api-key') || (req.query.key as string)
@@ -55,23 +63,28 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   if (rec.sock) return rec
 
   const authPath = path.join(AUTH_DIR, sessionId)
-  await fs.mkdir(authPath, { recursive: true })
+  try { fs.mkdirSync(authPath, { recursive: true }) } catch {}
+
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
 
-const sock = makeWASocket({
-  version,
-  auth: state,
-  printQRInTerminal: false,
-  // fingerprint plus "passe-partout"
-  browser: Browsers.ubuntu('Chrome'), // ou Browsers.windows('Chrome')
-  // éviter les transferts volumineux pendant l’appairage
-  syncFullHistory: false,
-  markOnlineOnConnect: false,
-  // timeouts un peu plus généreux après l’appairage
-  connectTimeoutMs: 60_000,
-  defaultQueryTimeoutMs: 60_000
-})
+  // Proxy résidentiel optionnel (HTTPS_PROXY ou HTTP_PROXY)
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY
+  const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: Browsers.ubuntu('Chrome'),
+    // IMPORTANT : d'abord false pour éviter des rejets pendant le 1er lien
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    // route la websocket via proxy si fourni
+    agent
+  })
 
   rec.sock = sock
   rec.status = 'connecting'
@@ -86,20 +99,25 @@ const sock = makeWASocket({
 
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u
+
     if (qr) rec.lastQR = { qr, ts: Date.now() }
 
     if (connection === 'open') {
       rec.status = 'open'
       rec.phone = sock.user?.id || null
       log.info({ sessionId, phone: rec.phone }, 'session connected')
-    }
-    if (connection === 'close') {
-      const reason = (lastDisconnect as any)?.error?.message || 'unknown'
+    } else if (connection === 'close') {
+      // extrait au mieux la raison (inclut stream:error 515)
+      const err = (lastDisconnect as any)?.error
+      let reason =
+        err?.output?.payload?.message ||
+        err?.message ||
+        (err?.data && JSON.stringify(err.data)) ||
+        'unknown'
       rec.status = 'close'
       rec.phone = null
       log.warn({ sessionId, reason }, 'session closed')
-    }
-    if (connection === 'connecting') {
+    } else if (connection === 'connecting') {
       rec.status = 'connecting'
     }
   })
@@ -111,6 +129,7 @@ async function logoutSession(sessionId: string) {
   const rec = ensureSessionRec(sessionId)
   if (rec.sock) {
     try { await rec.sock.logout() } catch {}
+    try { rec.sock.ws.close() } catch {}
   }
   sessions.delete(sessionId)
 }
@@ -123,10 +142,10 @@ app.use(express.json())
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// create/ensure session
+// créer / assurer la session (idempotent)
 app.post('/sessions', authz, async (req, res) => {
   try {
-    const id = (req.body?.sessionId as string)?.trim()
+    const id = String(req.body?.sessionId || '').trim()
     if (!id) return res.status(400).json({ error: 'sessionId required' })
     const rec = await startSocket(id)
     return res.json({
@@ -144,7 +163,7 @@ app.post('/sessions', authz, async (req, res) => {
   }
 })
 
-// session status
+// statut session
 app.get('/sessions/:id', authz, (req, res) => {
   const id = req.params.id
   const rec = ensureSessionRec(id)
@@ -160,7 +179,7 @@ app.get('/sessions/:id', authz, (req, res) => {
   })
 })
 
-// per-session QR
+// QR (JSON)
 app.get('/sessions/:id/qr', authz, (req, res) => {
   const id = req.params.id
   const rec = ensureSessionRec(id)
@@ -169,6 +188,7 @@ app.get('/sessions/:id/qr', authz, (req, res) => {
   return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
 })
 
+// QR (PNG) — pratique pour <img>
 app.get('/sessions/:id/qr.png', authz, async (req, res) => {
   const id = req.params.id
   const rec = ensureSessionRec(id)
@@ -183,7 +203,7 @@ app.get('/sessions/:id/qr.png', authz, async (req, res) => {
   }
 })
 
-// global QR for 'default' (compat)
+// compat: QR global pour "default"
 app.get('/qr', authz, (_req, res) => {
   const id = 'default'
   const rec = ensureSessionRec(id)
@@ -192,7 +212,7 @@ app.get('/qr', authz, (_req, res) => {
   return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
 })
 
-// pairing-code (if supported by the lib)
+// pairing-code (si dispo dans la lib)
 app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
   try {
     const id = req.params.id
@@ -200,12 +220,10 @@ app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
     if (!phoneNumber) return res.status(400).json({ error: 'phoneNumber required' })
 
     const rec = await startSocket(id)
-    const sock = rec.sock!
-    // @ts-ignore – some versions expose requestPairingCode
+    const sock = rec.sock as any
     if (typeof sock.requestPairingCode !== 'function') {
       return res.status(501).json({ error: 'pairing-code-not-supported' })
     }
-    // @ts-ignore
     const code: string = await sock.requestPairingCode(String(phoneNumber), custom ? String(custom) : undefined)
     return res.json({ sessionId: id, pairingCode: code })
   } catch (e: any) {
@@ -214,29 +232,25 @@ app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
   }
 })
 
-// logout
+// logout (conserve les fichiers)
 app.post('/sessions/:id/logout', authz, async (req, res) => {
   const id = req.params.id
   await logoutSession(id)
   return res.json({ ok: true, sessionId: id, status: 'disconnected' })
 })
 
-async function boot() {
-  // create required folders (no top-level await)
-  await fs.mkdir(DATA_DIR, { recursive: true })
-  await fs.mkdir(AUTH_DIR, { recursive: true })
-  await fs.mkdir(MEDIA_DIR, { recursive: true })
+// reset total: supprime les creds disque
+app.delete('/sessions/:id', authz, async (req, res) => {
+  const id = req.params.id
+  await logoutSession(id)
+  try { fs.rmSync(path.join(AUTH_DIR, id), { recursive: true, force: true }) } catch {}
+  return res.json({ ok: true, sessionId: id, status: 'deleted' })
+})
 
-  const PORT = Number(process.env.PORT || 3001)
-  app.listen(PORT, () => {
-    log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
-    log.info(`HTTP listening on :${PORT}`)
-    // auto-boot default session for compat
-    startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
-  })
-}
-
-boot().catch(err => {
-  log.error({ err }, 'fatal boot error')
-  process.exit(1)
+const PORT = Number(process.env.PORT || 3001)
+app.listen(PORT, () => {
+  log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
+  log.info(`HTTP listening on :${PORT}`)
+  // Boot auto de "default" pour compat
+  startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
 })
