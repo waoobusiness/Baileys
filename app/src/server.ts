@@ -57,10 +57,26 @@ const ensureSessionRec = (id: string): SessionRec => {
   return rec
 }
 
+/** crée un agent proxy uniquement si l’URL est valide et http/https */
+function makeProxyAgent(url: string | undefined) {
+  if (!url) return undefined
+  try {
+    const u = new URL(url)
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      return new HttpsProxyAgent(u)
+    }
+    log.warn({ url }, 'WS_PROXY_URL protocol not supported (use http/https); proxy ignored')
+    return undefined
+  } catch (err) {
+    log.warn({ err, url }, 'Invalid WS_PROXY_URL; proxy ignored')
+    return undefined
+  }
+}
+
 /** Abonne un handler et le désabonne via le retour cleanup */
 function subscribeConnectionUpdate(sock: WASocket, cb: (u: any) => void) {
   const handler = (u: any) => cb(u)
-  // @ts-ignore types de l'EventEmitter Baileys
+  // @ts-ignore EventEmitter de Baileys
   sock.ev.on('connection.update', handler)
   return () => {
     // @ts-ignore
@@ -106,9 +122,9 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   const { state, saveCreds } = await useMultiFileAuthState(authPath)
   const { version } = await fetchLatestBaileysVersion()
 
-  const agent = WS_PROXY_URL ? new HttpsProxyAgent(WS_PROXY_URL) : undefined
+  const agent = makeProxyAgent(WS_PROXY_URL)
 
-  // NB: on caste en any pour accepter connectOptions malgré le typage actuel
+  // NB: cast en any pour autoriser connectOptions selon les versions
   const sock = makeWASocket({
     version,
     auth: state,
@@ -125,7 +141,7 @@ async function startSocket(sessionId: string): Promise<SessionRec> {
   rec.phone = null
   rec.lastQR = null
 
-  // Debounce simple pour saveCreds
+  // Debounce saveCreds
   let saving = false
   sock.ev.on('creds.update', async () => {
     if (saving) return
@@ -266,7 +282,7 @@ async function main() {
     return res.json({ sessionId: id, qr: entry.qr, qrAt: entry.ts })
   })
 
-  // pairing code — attendre la fenêtre "connecting/qr"
+  // pairing code
   app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
     try {
       const id = req.params.id
@@ -283,7 +299,6 @@ async function main() {
 
       await onceWithTimeout(
         (cb) => subscribeConnectionUpdate(sock, cb as any),
-        // ok dès qu'on voit "connecting" ou un qr
         (u: any) => u?.connection === 'connecting' || !!u?.qr,
         20000
       )
