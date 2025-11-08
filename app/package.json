@@ -1,12 +1,13 @@
 {
   "name": "zuria-baileys-gateway",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "private": true,
   "type": "commonjs",
   "engines": {
     "node": ">=20 <23"
   },
   "scripts": {
+    "preinstall": "npm config delete proxy || true && npm config delete https-proxy || true",
     "build": "tsc",
     "start": "node dist/server.js"
   },
