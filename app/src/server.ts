@@ -22,6 +22,8 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data-auth');
 const AUTO_DOWNLOAD_MEDIA = process.env.AUTO_DOWNLOAD_MEDIA === '1';
+const MEDIA_MAX_AGE_HOURS = parseInt(process.env.MEDIA_MAX_AGE_HOURS || '12', 10);
+const MEDIA_MAX_AGE_MS = MEDIA_MAX_AGE_HOURS * 60 * 60 * 1000;
 const ECHO_REPLY = process.env.ECHO_REPLY === '1';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const WEBHOOK_OUTBOX_URL = process.env.WEBHOOK_OUTBOX_URL || '';
@@ -158,21 +160,25 @@ async function maybeDownloadMedia(wamessage: WAMessage) {
   if (!mediaEntry) return null;
 
   try {
-    // Provide reuploadRequest + logger to satisfy TS typings
     const buffer = await downloadMediaMessage(
       wamessage,
       'buffer',
       {},
       { reuploadRequest: sock!.updateMediaMessage, logger }
     );
-    const mt: string = mediaEntry.mimetype || 'application/octet-stream';
-    const ext = mime.extension(mt) || 'bin';
+    const mt = (mediaEntry.mimetype || 'application/octet-stream') as string;
+    const ext = (mime.extension(mt) || 'bin') as string;
     const fname = `${wamessage.key?.id}.${ext}`;
     const fpath = path.join(MEDIA_DIR, fname);
     fs.writeFileSync(fpath, buffer);
     return { file: `/media/${fname}`, mimetype: mt, bytes: buffer.length };
   } catch (e: any) {
-    logger.warn({ err: e?.message }, 'media download failed');
+    const msg = String(e?.message || '');
+    if (/403/.test(msg)) {
+      logger.info('media download skipped (403 forbidden)');
+      return { error: 'forbidden' as const };
+    }
+    logger.warn({ err: msg }, 'media download failed');
     return { error: 'download_failed' as const };
   }
 }
@@ -200,7 +206,7 @@ async function startSock() {
     browser: ['Zuria.AI', 'Chrome', '1.0.0'],
     // ------------------------------
     syncFullHistory: true,
-    printQRInTerminal: true,
+    // printQRInTerminal removed (deprecated)
     getMessage: async (key) => {
       if (!key?.remoteJid || !key?.id) return undefined;
       const cached = findMessage(key.remoteJid, key.id);
@@ -275,16 +281,17 @@ async function startSock() {
       for (const m of newMessages as WAMessage[]) {
         const jid = m.key?.remoteJid;
         if (!jid || isStatusJid(jid)) continue;
+        const ts = Number((m as any).messageTimestamp) * 1000 || Date.now();
         const entry: StoredMessage = {
           key: m.key || undefined,
           pushName: (m as any).pushName || null,
-          timestamp: Number((m as any).messageTimestamp) * 1000 || Date.now(),
+          timestamp: ts,
           type: Object.keys(m.message || {})[0] || null,
           text: extractText(m),
           reactions: [],
           raw: m
         };
-        if (AUTO_DOWNLOAD_MEDIA) {
+        if (AUTO_DOWNLOAD_MEDIA && (Date.now() - ts) <= MEDIA_MAX_AGE_MS) {
           const media = await maybeDownloadMedia(m);
           if (media) entry.media = media;
         }
@@ -365,16 +372,17 @@ async function startSock() {
       const jid = m.key?.remoteJid;
       if (!jid || isStatusJid(jid)) continue;
 
+      const ts = Number((m as any).messageTimestamp) * 1000 || Date.now();
       const entry: StoredMessage = {
         key: m.key || undefined,
         pushName: (m as any).pushName || null,
-        timestamp: Number((m as any).messageTimestamp) * 1000 || Date.now(),
+        timestamp: ts,
         type: Object.keys(m.message || {})[0] || null,
         text: extractText(m),
         reactions: [],
         raw: m
       };
-      if (AUTO_DOWNLOAD_MEDIA) {
+      if (AUTO_DOWNLOAD_MEDIA && (Date.now() - ts) <= MEDIA_MAX_AGE_MS) {
         const media = await maybeDownloadMedia(m);
         if (media) entry.media = media;
       }
