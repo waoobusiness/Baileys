@@ -295,7 +295,7 @@ app.get('/messages', requireAuth, async (req, res) => {
     const jid = jidNormalize(String(req.query.jid || ''))
     const limit = Number(req.query.limit || 25)
     if (!jid) return res.status(400).json({ error: 'jid required' })
-    const msgs = await store.loadMessages(jid, limit)
+		const msgs = await store.loadMessages(jid, limit, undefined as any)
     const mapped = msgs.map((m: any) => {
       const t = messageToText(m)
       return {
@@ -397,7 +397,7 @@ app.post('/react', requireAuth, async (req, res) => {
     if (!jid || !id) return res.status(400).json({ error: 'jid and id required' })
     const j = jidNormalize(jid)
     // find original message
-    const msgs = await store.loadMessages(j, 50)
+		const msgs = await store.loadMessages(j, 50, undefined as any)
     const original = msgs.find((m: any) => m.key?.id === id)
     if (!original) return res.status(404).json({ error: 'message not found in store' })
     const emj = normalizeEmoji(emoji, emojiCode)
