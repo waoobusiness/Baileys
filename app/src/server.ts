@@ -15,7 +15,7 @@ import {
 } from '@whiskeysockets/baileys'
 
 // ✅ import explicite du store (compatible 6.7.x)
-import makeInMemoryStore from '@whiskeysockets/baileys/lib/Store/make-in-memory-store.js'
+import { makeInMemoryStore } from '@rodrigogs/baileys-store'
 
 import fs from 'fs'
 import fsp from 'fs/promises'
