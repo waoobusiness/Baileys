@@ -17,6 +17,10 @@ import {
 import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
+import carsRouter from './cars-router'
+// ...
+app.use('/cars', requireAuth, carsRouter) // protège les routes /cars/*
+
 
 /* ------------------------- logger & app ------------------------- */
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
