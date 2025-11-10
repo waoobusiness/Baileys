@@ -267,6 +267,43 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
   connectWA()
   res.json({ ok: true })
 })
+/* ----------------------- CARS RESOLVER ------------------------ */
+const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
+
+function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
+  const h = String(req.headers.authorization || '')
+  const t = h.startsWith('Bearer ') ? h.slice(7) : ''
+  if (!RESOLVER_BEARER) return res.status(500).json({ ok:false, error:'resolver bearer not set' })
+  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok:false, error:'unauthorized' })
+  next()
+}
+
+// Santé
+app.get('/cars/health', (_req, res) => {
+  res.json({ ok: true, service: 'cars-resolver', ts: Date.now() })
+})
+
+// Connect: reçoit un lien (listing AutoScout24 ou page garage)
+app.post('/cars/connect', requireResolverAuth, async (req, res) => {
+  const link = String(req.body.link || '')
+  if (!link) return res.status(400).json({ ok:false, error:'link required' })
+
+  // TODO: ici tu mettras ta logique de résolution (détection listing/garage + fetch)
+  // Pour l’instant on renvoie un stub propre pour que Lovable ne soit plus en 404.
+  const kind = /autoscout24/i.test(link)
+    ? (/\/d\//.test(link) ? 'listing' : 'garage')
+    : 'unknown'
+
+  return res.json({ ok:true, kind, link })
+})
+
+// (facultatif) Preview: même signature que connect, utile si Lovable appelle /preview
+app.post('/cars/preview', requireResolverAuth, async (req, res) => {
+  const link = String(req.body.link || '')
+  if (!link) return res.status(400).json({ ok:false, error:'link required' })
+  return res.json({ ok:true, preview:true, link })
+})
+
 
 /* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
