@@ -29,7 +29,10 @@ app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
 /* --------------------------- security -------------------------- */
-const AUTH_TOKEN = process.env.AUTH_TOKEN || 'MY_PRIVATE_FURIA_API_KEY_2025'
+const AUTH_TOKEN =  
+	process.env.RESOLVER_BEARER ||
+  process.env.AUTH_TOKEN ||
+  'MY_PRIVATE_FURIA_API_KEY_2025''MY_PRIVATE_FURIA_API_KEY_2025'
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const hdr = (req.headers['authorization'] || '').toString()
   const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
