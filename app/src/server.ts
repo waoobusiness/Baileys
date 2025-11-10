@@ -521,6 +521,61 @@ app.post('/send-image', requireAuth, async (req, res) => {
   }
 });
 
+// ---------- Send audio (voice note or regular) ----------
+app.post('/send-audio', requireAuth, async (req, res) => {
+  try {
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+
+    const { to, url, dataUrl, ptt } = req.body || {};
+    if (!to || (!url && !dataUrl)) {
+      return res.status(400).json({ error: 'to and (url or dataUrl) required' });
+    }
+
+    const jid = to.includes('@') ? to : `${String(to).replace(/\D/g, '')}@s.whatsapp.net`;
+
+    if (url) {
+      await sock.sendMessage(jid, { audio: { url }, ptt: !!ptt });
+    } else {
+      const base64 = String(dataUrl).split(',')[1] || dataUrl;
+      const bin = Buffer.from(base64, 'base64');
+      await sock.sendMessage(jid, { audio: bin, ptt: !!ptt });
+    }
+
+    res.json({ ok: true, to: jid, ptt: !!ptt });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Send document (PDF, DOCX, etc.) ----------
+app.post('/send-document', requireAuth, async (req, res) => {
+  try {
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+
+    const { to, url, dataUrl, mimetype, fileName } = req.body || {};
+    if (!to || (!url && !dataUrl)) {
+      return res.status(400).json({ error: 'to and (url or dataUrl) required' });
+    }
+
+    const jid = to.includes('@') ? to : `${String(to).replace(/\D/g, '')}@s.whatsapp.net`;
+    const mt = mimetype || 'application/pdf';
+    const name = fileName || 'document.pdf';
+
+    if (url) {
+      await sock.sendMessage(jid, { document: { url }, mimetype: mt, fileName: name });
+    } else {
+      const base64 = String(dataUrl).split(',')[1] || dataUrl;
+      const bin = Buffer.from(base64, 'base64');
+      await sock.sendMessage(jid, { document: bin, mimetype: mt, fileName: name });
+    }
+
+    res.json({ ok: true, to: jid, mimetype: mt, fileName: name });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // React to a message: { jid, id, emoji }
 app.post('/react', requireAuth, async (req, res) => {
   try {
