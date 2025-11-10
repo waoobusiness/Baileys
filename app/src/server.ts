@@ -12,7 +12,10 @@ import {
   fetchLatestBaileysVersion,
   WAMessageKey,
   jidDecode,
-  proto
+  proto,
+  // Types récents Baileys
+  IMessage,
+  IMessageKey,
 } from '@whiskeysockets/baileys'
 import fs from 'fs'
 import fsp from 'fs/promises'
@@ -39,13 +42,14 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 let sock: WASocket | null = null
 const AUTH_DIR = path.join(process.cwd(), 'auth')
 
-// contacts/chats/messages — ultra-simple in-memory store
+// in-memory
 type Contact = { id: string; name?: string; notify?: string; verifiedName?: string; isBusiness?: boolean }
 type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: number }
 
 const contactsMap = new Map<string, Contact>()
 const chatsMap    = new Map<string, Chat>()
-const msgMap      = new Map<string, proto.IWebMessageInfo[]>() // by jid, keep last N
+// on garde volontairement any pour rester compatible avec les changements de types Baileys
+const msgMap      = new Map<string, any[]>() // par jid, derniers messages
 
 const MSG_CAP = 200
 let currentQR: string | null = null
@@ -61,8 +65,8 @@ function toJid(input: string): string {
   return `${num}@s.whatsapp.net`
 }
 
-function pushMessage(m: proto.IWebMessageInfo) {
-  const jid = m.key?.remoteJid || ''
+function pushMessage(m: any) {
+  const jid = m?.key?.remoteJid || ''
   if (!jid) return
   const arr = msgMap.get(jid) || []
   arr.push(m)
@@ -89,84 +93,89 @@ async function connectWA() {
     markOnlineOnConnect: false,
     syncFullHistory: false,
     shouldIgnoreJid: () => false,
-    getMessage: async (key: WAMessageKey) => {
-      const arr = msgMap.get(key.remoteJid || '') || []
-      const found = arr.find(m => m.key?.id === key.id)
-      return found ?? undefined
-    }
+    // Adapter la signature aux derniers types IMessage/IMessageKey
+    getMessage: async (key: IMessageKey): Promise<IMessage | undefined> => {
+      const jid = key.remoteJid || ''
+      const arr = msgMap.get(jid) || []
+      const found = arr.find((m: any) => m?.key?.id === key.id)
+      return (found as unknown as IMessage) ?? undefined
+    },
   })
 
+  // on typage-relax "any" pour rester compatibles avec les nouvelles versions
+  const ev: any = sock.ev
+
   /* ---------- persist creds ---------- */
-  sock.ev.on('creds.update', saveCreds)
+  ev.on('creds.update', saveCreds)
 
   /* ---------- contacts/chats bootstrap ---------- */
-  sock.ev.on('contacts.set', ({ contacts }) => {
-    for (const c of contacts) {
+  ev.on('contacts.set', ({ contacts }: any) => {
+    for (const c of contacts || []) {
       if (!c?.id) continue
       contactsMap.set(c.id, {
         id: c.id,
         name: c.name,
-        notify: (c as any).notify,
-        verifiedName: (c as any).verifiedName,
-        isBusiness: (c as any).isBusiness
+        notify: c.notify,
+        verifiedName: c.verifiedName,
+        isBusiness: c.isBusiness,
       })
     }
   })
-  sock.ev.on('contacts.update', (updates) => {
-    for (const u of updates) {
-      if (!u.id) continue
+  ev.on('contacts.update', (updates: any[]) => {
+    for (const u of updates || []) {
+      if (!u?.id) continue
       const prev = contactsMap.get(u.id) || { id: u.id }
       contactsMap.set(u.id, { ...prev, ...u })
     }
   })
-  sock.ev.on('chats.set', ({ chats, isLatest }) => {
-    for (const c of chats) {
+  ev.on('chats.set', ({ chats, isLatest }: any) => {
+    for (const c of chats || []) {
       chatsMap.set(c.id, {
         jid: c.id,
-        name: (c as any).name,
-        unreadCount: (c as any).unreadCount,
-        lastMsgTs: (c as any).lastMsgRecv
+        name: c.name,
+        unreadCount: c.unreadCount,
+        lastMsgTs: c.lastMsgRecv,
       })
     }
-    logger.info({ count: chats.length, isLatest }, 'chats.set')
+    logger.info({ count: (chats || []).length, isLatest }, 'chats.set')
   })
-  sock.ev.on('chats.upsert', (chs) => {
-    for (const c of chs) {
+  ev.on('chats.upsert', (chs: any[]) => {
+    for (const c of chs || []) {
       chatsMap.set(c.id, {
         jid: c.id,
-        name: (c as any).name,
-        unreadCount: (c as any).unreadCount,
-        lastMsgTs: (c as any).lastMsgRecv
+        name: c.name,
+        unreadCount: c.unreadCount,
+        lastMsgTs: c.lastMsgRecv,
       })
     }
   })
-  sock.ev.on('chats.update', (chs) => {
-    for (const c of chs) {
-      const prev = chatsMap.get(c.id!) || { jid: c.id! }
-      chatsMap.set(c.id!, { ...prev, name: (c as any).name ?? prev.name })
+  ev.on('chats.update', (chs: any[]) => {
+    for (const c of chs || []) {
+      const prev = chatsMap.get(c.id) || { jid: c.id }
+      chatsMap.set(c.id, { ...prev, name: c.name ?? prev.name })
     }
   })
 
   /* ---------- messages ---------- */
-  sock.ev.on('messages.set', ({ chats, messages, isLatest }) => {
-    for (const m of messages) pushMessage(m)
-    logger.info({ chats: chats.length, messages: messages.length, isLatest }, 'messages.set')
+  ev.on('messages.set', ({ chats, messages, isLatest }: any) => {
+    for (const m of messages || []) pushMessage(m)
+    logger.info({ chats: (chats || []).length, messages: (messages || []).length, isLatest }, 'messages.set')
   })
-  sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const m of messages) pushMessage(m)
+  ev.on('messages.upsert', ({ messages }: any) => {
+    for (const m of messages || []) pushMessage(m)
   })
-  sock.ev.on('messages.update', (updates) => {
-    for (const u of updates) {
-      const jid = u.key?.remoteJid || ''
+  ev.on('messages.update', (updates: any[]) => {
+    for (const u of updates || []) {
+      const jid = u?.key?.remoteJid || ''
       const arr = msgMap.get(jid)
       if (!arr) continue
-      const idx = arr.findIndex(m => m.key?.id === u.key?.id)
-      if (idx >= 0) arr[idx] = { ...arr[idx], ...u } as any
+      const idx = arr.findIndex((m: any) => m?.key?.id === u?.key?.id)
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...u }
     }
   })
 
   /* ---------- connection lifecycle ---------- */
-  sock.ev.on('connection.update', async (u) => {
+  ev.on('connection.update', async (u: any) => {
     const { connection, lastDisconnect, qr } = u
 
     if (qr) {
@@ -186,7 +195,7 @@ async function connectWA() {
       const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
       logger.warn({ code, reason: DisconnectReason[code as any] }, 'connection closed')
 
-      // 515 = restart required -> reconnect WITHOUT wiping auth
+      // 515 = restart required -> reconnect sans wipe
       if (code === 515 || code === DisconnectReason.restartRequired) {
         logger.warn('Restart required — reconnecting (no auth reset)')
         setTimeout(connectWA, 500)
@@ -200,18 +209,14 @@ async function connectWA() {
         return
       }
 
-      // other -> try reconnect
+      // autres -> tentative de reconnexion
       setTimeout(connectWA, 1000)
     }
   })
 }
 
 async function resetAuthAndRestart() {
-  try {
-    if (sock) {
-      await sock.logout() // will throw Intentional Logout in logs (normal)
-    }
-  } catch {}
+  try { if (sock) await sock.logout() } catch {}
   await resetAuthFolder()
   currentQR = null
   qrStatus = 'pending'
@@ -263,7 +268,7 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
   res.json({ ok: true })
 })
 
-/* --------- sending: text / image / audio / reaction  ---------- */
+/* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
   try {
     const jid = toJid(req.body.to)
@@ -289,7 +294,6 @@ app.post('/send-image', requireAuth, async (req, res) => {
   }
 })
 
-// audio normal (ptt=false) — pour note vocale utilisez /send-ptt
 app.post('/send-audio', requireAuth, async (req, res) => {
   try {
     const jid = toJid(req.body.to)
@@ -302,7 +306,6 @@ app.post('/send-audio', requireAuth, async (req, res) => {
   }
 })
 
-// voice note (push-to-talk)
 app.post('/send-ptt', requireAuth, async (req, res) => {
   try {
     const jid = toJid(req.body.to)
@@ -344,7 +347,7 @@ app.get('/chats', requireAuth, (_req, res) => {
 app.get('/messages', requireAuth, async (req, res) => {
   try {
     const jid = toJid((req.query.jid || '').toString())
-    const limit = Math.max(1, Math.min( Number(req.query.limit || 50), 200))
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200))
     const arr = (msgMap.get(jid) || []).slice(-limit)
     res.json({ jid, count: arr.length, messages: arr })
   } catch (e: any) {
