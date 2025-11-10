@@ -1,11 +1,16 @@
 import * as cheerio from 'cheerio';
-import type { Dealer, Vehicle } from './types.js';
+import pLimit from 'p-limit';
+import type { Dealer, Vehicle, VehicleImage } from './types.js';
 
 const UA = process.env.DEFAULT_USER_AGENT ?? 'Mozilla/5.0';
+const MIN = Number(process.env.REQUEST_BACKOFF_MS_MIN ?? 300);
+const MAX = Number(process.env.REQUEST_BACKOFF_MS_MAX ?? 700);
+const MAX_PAGES = Number(process.env.MAX_PAGES ?? 60);
 
 function normUrl(u: string) {
+  if (!u) return '';
   if (u.startsWith('http')) return u;
-  return 'https://www.autoscout24.ch' + u;
+  return 'https://www.autoscout24.ch' + (u.startsWith('/') ? u : `/${u}`);
 }
 
 export function detectKind(url: string): 'dealer'|'vehicle' {
@@ -17,38 +22,89 @@ export function detectKind(url: string): 'dealer'|'vehicle' {
 
 async function fetchHtml(url: string) {
   const res = await fetch(url, { headers: { 'User-Agent': UA, 'Accept-Language': 'fr-CH,fr;q=0.9' }, cache: 'no-store' as any });
-  if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
+  if (!res.ok) throw new Error(`Fetch ${url} → ${res.status}`);
   return res.text();
 }
 
-export async function getDealerFromVehicle(vehicleUrl: string): Promise<{ dealerUrl: string; vehicle: Partial<Vehicle> }> {
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+function backoff() { return sleep(MIN + Math.floor(Math.random()*(MAX-MIN))); }
+
+function parseSrcset(srcset?: string | null): string | null {
+  if (!srcset) return null;
+  const best = srcset.split(',').map(s => s.trim().split(' ')[0]).pop();
+  return best || null;
+}
+
+export async function getDealerFromVehicle(vehicleUrl: string): Promise<{ dealerUrl: string; vehicle: Partial<Vehicle>; images: VehicleImage[] }> {
   const html = await fetchHtml(vehicleUrl);
   const $ = cheerio.load(html);
 
-  // seller link
+  // Seller link
   const sellerA = $('a[href*="/s/seller-"]').first();
   const dealerUrl = normUrl(sellerA.attr('href') || '');
 
-  // quick vehicle info
+  // Vehicle id
   const idMatch = vehicleUrl.match(/-(\d{6,})$/);
   const platform_vehicle_id = idMatch ? idMatch[1] : '';
-  const title = $('h1').first().text().trim() || $('title').text().trim();
-  const price = $('[data-testid="price-vat"] , [data-testid="price"]').first().text().replace(/[^0-9]/g, '');
-  const price_chf = price ? Number(price) : null;
-  const thumb = $('img').first().attr('src') || null;
 
-  return {
-    dealerUrl,
-    vehicle: {
-      platform: 'autoscout24_ch',
-      platform_vehicle_id,
-      dealer_platform_id: '', // filled after dealer parsed
-      url: vehicleUrl,
-      title,
-      price_chf,
-      thumbnail: thumb
+  // Title/price
+  const title = $('h1').first().text().trim() || $('title').text().trim();
+  const price = $('[data-testid="price-vat"], [data-testid="price"]').first().text().replace(/[^0-9]/g, '');
+  const price_chf = price ? Number(price) : null;
+
+  // Specs (best effort, selectors tolérants)
+  const spec = (lbl: string) => $(`dt:contains("${lbl}")`).next('dd').text().trim();
+
+  const v: Partial<Vehicle> = {
+    platform: 'autoscout24_ch',
+    platform_vehicle_id,
+    dealer_platform_id: '',
+    url: vehicleUrl,
+    title,
+    price_chf,
+    brand: spec('Marque') || undefined,
+    model: spec('Modèle') || undefined,
+    year_month_reg: spec('1ère immatriculation')?.replace(/\s/g, '') || null,
+    mileage_km: Number((spec('Kilométrage')||'').replace(/\D/g,'')) || null,
+    fuel: spec('Carburant') || null,
+    transmission: spec('Boîte de vitesses') || null,
+    body_type: spec('Catégorie') || null,
+    drivetrain: spec('Roues motrices') || null,
+    power_ps: Number((spec('Puissance')||'').replace(/\D/g,'')) || null,
+    engine_displacement_cm3: Number((spec('Cylindrée')||'').replace(/\D/g,'')) || null,
+    doors: Number((spec('Portes')||'').replace(/\D/g,'')) || null,
+    seats: Number((spec('Sièges')||'').replace(/\D/g,'')) || null,
+    co2_g_km: Number((spec('CO₂')||'').replace(/\D/g,'')) || null,
+    efficiency_label: spec('Classe d\'efficacité') || null,
+    colors: { exterior: spec('Couleur extérieure') || null, interior: spec('Couleur intérieure') || null },
+    warranty: spec('Garantie') || null,
+    import_parallel: /import/i.test(spec('Origine')||'') || null,
+    accident: /accident/i.test(spec('État du véhicule')||'') || null,
+    ct_expertisee: /expertis|MFK/i.test(spec('Contrôle technique')||'') || null,
+    details_json: {
+      description: $('[data-testid="vehicle-description"]').text().trim() || null,
+      equipment_optional: $('ul[data-testid="optional-equipments"] li').map((_,li)=>$(li).text().trim()).get(),
+      equipment_standard: $('ul[data-testid="standard-equipments"] li').map((_,li)=>$(li).text().trim()).get(),
+      finance_texts: $('[data-testid="finance"]').map((_,e)=>$(e).text().trim()).get()
     }
   };
+
+  // Images
+  const imgs: VehicleImage[] = $('[data-testid="gallery"] img, img[srcset*="/vehicles/"]')
+    .map((i, img) => {
+      const src = $(img).attr('src') || parseSrcset($(img).attr('srcset'));
+      return src ? {
+        platform: 'autoscout24_ch',
+        platform_vehicle_id,
+        url: normUrl(src),
+        idx: i
+      } as VehicleImage : null;
+    }).get().filter(Boolean) as VehicleImage[];
+
+  // Thumbnail
+  v.thumbnail = imgs[0]?.url || null;
+
+  return { dealerUrl, vehicle: v, images: imgs };
 }
 
 export async function parseDealer(dealerUrl: string): Promise<Dealer> {
@@ -58,12 +114,15 @@ export async function parseDealer(dealerUrl: string): Promise<Dealer> {
   const platform_id = (dealerUrl.match(/seller-\d+/)?.[0]) ?? '';
   const name = $('h1, h2').first().text().trim();
   const address = $('[data-testid="address"]').text().trim() || $('address').text().trim();
-  const logo = $('img[alt*="logo"]').attr('src') || $('img[src*="/seller/logos/"]').attr('src') || null;
 
-  // ratings if present
+  const logo = $('img[alt*="logo"]').attr('src') ||
+               $('img[srcset*="/seller/logos/"]').attr('srcset') ||
+               $('img[src*="/seller/logos/"]').attr('src') || null;
+  const logo_url = logo?.includes('srcset') ? parseSrcset(logo) : logo;
+
+  // rating (si visible)
   const ratingTxt = $('[data-testid="rating"]').text().replace(',', '.');
   const rating = ratingTxt ? Number(ratingTxt) : null;
-
   let reviews_count: number | null = null;
   const rc = $('[data-testid="reviews-count"]').text().replace(/\D/g, '');
   if (rc) reviews_count = Number(rc);
@@ -76,57 +135,52 @@ export async function parseDealer(dealerUrl: string): Promise<Dealer> {
     address: address || undefined,
     rating,
     reviews_count,
-    logo_url: logo ? normUrl(logo) : null
+    logo_url: logo_url ? normUrl(logo_url) : null
   };
 }
 
-export async function listInventory(dealerUrl: string, maxPages = 40, depth: 'summary'|'full' = 'summary'): Promise<Vehicle[]> {
-  const dealerId = (dealerUrl.match(/seller-\d+/)?.[0]) ?? '';
-  const items: Vehicle[] = [];
-
-  for (let page = 1; page <= maxPages; page++) {
+// Liste toutes les cartes depuis la page vendeur (summary)
+export async function listInventorySummary(dealerUrl: string): Promise<Pick<Vehicle,'platform_vehicle_id'|'url'|'title'|'price_chf'>[]> {
+  const out: any[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
     const url = page === 1 ? dealerUrl : `${dealerUrl}?page=${page}`;
     const html = await fetchHtml(url);
     const $ = cheerio.load(html);
 
-    const links = $('a[href^="/fr/d/"], a[href^="/de/d/"], a[href^="/it/d/"]')
-      .map((_, a) => normUrl($(a).attr('href')!))
-      .get()
-      .filter((v, i, arr) => arr.indexOf(v) === i);
+    // cartes
+    const cards = $('[data-testid^="listing-card"] a[href^="/"], a[aria-label][href*="/d/"]');
+    if (!cards.length) break;
 
-    if (!links.length) break;
-
-    for (const vUrl of links) {
-      const idMatch = vUrl.match(/-(\d{6,})$/);
-      const platform_vehicle_id = idMatch ? idMatch[1] : '';
-      const title = $( `a[href*="${platform_vehicle_id}"]` ).attr('aria-label') || undefined;
-
-      const card = $(`a[href*="${platform_vehicle_id}"]`).closest('[data-testid^="listing-card"]');
-      const priceTxt = card.find('[data-testid="price"]').first().text().replace(/[^0-9]/g,'');
-      const price_chf = priceTxt ? Number(priceTxt) : null;
-
-      const vehicle: Vehicle = {
-        platform: 'autoscout24_ch',
-        platform_vehicle_id,
-        dealer_platform_id: dealerId,
-        url: vUrl,
+    cards.each((_, a) => {
+      const href = normUrl($(a).attr('href')!);
+      const id = href.match(/-(\d{6,})$/)?.[1];
+      if (!id) return;
+      const title = $(a).attr('aria-label') || $(a).text().trim();
+      const priceTxt = $(a).closest('[data-testid^="listing-card"]').find('[data-testid="price"]').first().text().replace(/\D/g,'');
+      out.push({
+        platform_vehicle_id: id,
+        url: href,
         title,
-        price_chf,
-        brand: undefined,
-        model: undefined,
-        year_month_reg: null,
-        mileage_km: null,
-        fuel: null,
-        transmission: null,
-        thumbnail: null,
-        details_json: depth === 'summary' ? null : {}
-      };
-      items.push(vehicle);
-    }
+        price_chf: priceTxt ? Number(priceTxt) : null
+      });
+    });
 
-    // petit backoff pour éviter d'être trop agressif
-    await new Promise(r => setTimeout(r, 350 + Math.floor(Math.random()*250)));
+    await backoff();
   }
+  // dédoublonnage par id
+  const seen = new Set<string>();
+  return out.filter(v => (seen.has(v.platform_vehicle_id) ? false : (seen.add(v.platform_vehicle_id), true)));
+}
 
-  return items;
+// Enrichit chaque véhicule (détails complets + images)
+export async function hydrateVehicles(dealerId: string, items: any[]) {
+  const limit = pLimit(4);
+  const results: { vehicle: Vehicle; images: VehicleImage[] }[] = [];
+  await Promise.all(items.map(it => limit(async () => {
+    const { dealerUrl, vehicle, images } = await getDealerFromVehicle(it.url);
+    const v: Vehicle = { ...vehicle, dealer_platform_id: dealerId } as Vehicle;
+    results.push({ vehicle: v, images });
+    await backoff();
+  })));
+  return results;
 }
