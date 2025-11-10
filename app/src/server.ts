@@ -1,510 +1,534 @@
-import express from 'express'
-import cors from 'cors'
-import pino from 'pino'
-import path from 'node:path'
-import fs from 'node:fs/promises'
-import QRCode from 'qrcode'
+import express from 'express';
+import pino from 'pino';
+import fs from 'fs';
+import path from 'path';
+import qrcode from 'qrcode';
+import mime from 'mime-types';
 import {
-  default as makeWASocket,
+  makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers,
+  DisconnectReason,
   downloadMediaMessage,
-  type WASocket,
-  type WAMessage
-} from '@whiskeysockets/baileys'
+  Browsers,
+  fetchLatestBaileysVersion,
+  WAMessage,
+  proto
+} from '@whiskeysockets/baileys';
+import { EventEmitter } from 'events';
 
-/* ========= config ========= */
+// ---------- ENV & paths ----------
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data-auth');
+const AUTO_DOWNLOAD_MEDIA = process.env.AUTO_DOWNLOAD_MEDIA === '1';
+const ECHO_REPLY = process.env.ECHO_REPLY === '1';
 
-const log = pino({ level: process.env.LOG_LEVEL || 'info' })
-const API_KEY = process.env.API_KEY || 'dev-key'
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:3001'
-const DATA_DIR = process.env.DATA_DIR || '/data'
-const AUTH_DIR = process.env.AUTH_DIR || path.join(DATA_DIR, 'auth_info_baileys')
-const MEDIA_DIR = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media')
+// ---------- Logger ----------
+const logger = pino({ level: LOG_LEVEL });
 
-const QR_TTL_MS = 90_000
+// ---------- Express ----------
+const app = express();
+app.use(express.json({ limit: '20mb' }));
 
-/* ========= helpers ========= */
+// ---------- Storage (filesystem) ----------
+const STORE_DIR = path.join(DATA_DIR, 'store');
+const MEDIA_DIR = path.join(DATA_DIR, 'media');
+const MSG_DIR = path.join(STORE_DIR, 'messages');
 
-async function ensureDirs() {
-  await fs.mkdir(DATA_DIR, { recursive: true })
-  await fs.mkdir(AUTH_DIR, { recursive: true })
-  await fs.mkdir(MEDIA_DIR, { recursive: true })
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(STORE_DIR, { recursive: true });
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
+fs.mkdirSync(MSG_DIR, { recursive: true });
+
+const contactsPath = path.join(STORE_DIR, 'contacts.json');
+const chatsPath = path.join(STORE_DIR, 'chats.json');
+
+type Contact = {
+  jid: string;
+  name?: string | null;
+  notify?: string | null;
+  verifiedName?: string | null;
+  isBusiness?: boolean;
+};
+type Chat = {
+  jid: string;
+  name?: string | null;
+  unreadCount?: number;
+  lastMsgTs?: number;
+};
+type StoredMessage = {
+  key?: proto.IMessageKey | null;
+  pushName?: string | null;
+  timestamp?: number;
+  type?: string | null;
+  text?: string | null;
+  reactions?: Array<{ from: string; emoji: string; ts: number }>;
+  media?: { file: string; mimetype: string; bytes: number } | { error: string };
+  raw?: WAMessage;
+};
+
+function readJSON<T>(p: string, def: T): T {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')) as T; } catch { return def; }
 }
-const now = () => Date.now()
-
-const authz: express.RequestHandler = (req, res, next) => {
-  const key = req.get('x-api-key') || (req.query.key as string)
-  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' })
-  next()
+function writeJSON(p: string, obj: unknown) {
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
 }
-
-/* ========= simple in-memory store ========= */
-
-type Contact = Record<string, any>
-type Chat = Record<string, any>
-
-type MediaMeta = {
-  id: string
-  jid: string
-  type: 'image'|'video'|'audio'|'document'|'sticker'
-  mimetype?: string
-  fileName?: string
-  seconds?: number
-  bytes?: number
-  ts: number
+function msgFile(jid: string) { return path.join(MSG_DIR, encodeURIComponent(jid) + '.ndjson'); }
+function appendMessage(jid: string, obj: StoredMessage) {
+  fs.appendFileSync(msgFile(jid), JSON.stringify(obj) + '\n');
 }
-
-type SessionRec = {
-  id: string
-  sock?: WASocket
-  status: 'connecting'|'open'|'close'
-  phone?: string|null
-  lastQR?: { qr: string; ts: number } | null
-  savingCreds?: boolean
-
-  contacts: Map<string, Contact>
-  chats: Map<string, Chat>
-  messages: Map<string, WAMessage[]>
-  mediaIndex: Map<string, MediaMeta>
-  webhook?: string | null
+function readMessages(jid: string, limit = 50, beforeTs?: number | null): StoredMessage[] {
+  const file = msgFile(jid);
+  if (!fs.existsSync(file)) return [];
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+  let arr = lines.map((l) => { try { return JSON.parse(l) as StoredMessage; } catch { return null as any; } })
+                 .filter(Boolean);
+  if (beforeTs) arr = arr.filter((m) => (m.timestamp || 0) < beforeTs);
+  return arr.slice(-limit);
 }
-
-const sessions = new Map<string, SessionRec>()
-
-function ensureSessionRec(id: string): SessionRec {
-  let rec = sessions.get(id)
-  if (!rec) {
-    rec = {
-      id,
-      status: 'close',
-      phone: null,
-      lastQR: null,
-      contacts: new Map(),
-      chats: new Map(),
-      messages: new Map(),
-      mediaIndex: new Map(),
-      webhook: null
-    }
-    sessions.set(id, rec)
+function findMessage(jid: string, id: string): StoredMessage | null {
+  const file = msgFile(jid);
+  if (!fs.existsSync(file)) return null;
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = JSON.parse(lines[i]) as StoredMessage;
+    if ((m.key as any)?.id === id) return m;
   }
-  return rec
+  return null;
 }
 
-function unwrapMsgContent(m: WAMessage) {
-  const msg = m.message || {}
-  if ((msg as any).viewOnceMessage?.message) return (msg as any).viewOnceMessage.message
-  return msg
+let contacts: Record<string, Contact> = readJSON(contactsPath, {});
+let chats: Record<string, Chat> = readJSON(chatsPath, {});
+function saveContacts() { writeJSON(contactsPath, contacts); }
+function saveChats() { writeJSON(chatsPath, chats); }
+
+// ---------- WA socket state ----------
+let sock: ReturnType<typeof makeWASocket> | null = null;
+let lastQR: string | null = null;
+let connInfo: { status: string; reason?: string } = { status: 'starting' };
+
+const bus = new EventEmitter();
+function emitEvent(type: string, payload: any) {
+  bus.emit('evt', { type, payload, t: Date.now() });
 }
 
-function indexMedia(rec: SessionRec, m: WAMessage) {
-  const content = unwrapMsgContent(m)
-  const id = m.key.id
-  const jid = m.key.remoteJid
-  if (!id || !jid) return
+function extractText(msg?: WAMessage): string | null {
+  const m = msg?.message as any;
+  if (!m) return null;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    null
+  );
+}
+function isStatusJid(jid?: string | null) { return jid === 'status@broadcast'; }
 
-  const meta =
-    content.imageMessage ? ({
-      id, jid, type: 'image',
-      mimetype: content.imageMessage.mimetype,
-      bytes: Number(content.imageMessage.fileLength || 0),
-      ts: Number(m.messageTimestamp) || now()
-    } as MediaMeta)
-  : content.videoMessage ? ({
-      id, jid, type: 'video',
-      mimetype: content.videoMessage.mimetype,
-      bytes: Number(content.videoMessage.fileLength || 0),
-      seconds: Number(content.videoMessage.seconds || 0),
-      ts: Number(m.messageTimestamp) || now()
-    } as MediaMeta)
-  : content.audioMessage ? ({
-      id, jid, type: 'audio',
-      mimetype: content.audioMessage.mimetype,
-      bytes: Number(content.audioMessage.fileLength || 0),
-      seconds: Number(content.audioMessage.seconds || 0),
-      ts: Number(m.messageTimestamp) || now()
-    } as MediaMeta)
-  : content.documentMessage ? ({
-      id, jid, type: 'document',
-      mimetype: content.documentMessage.mimetype,
-      fileName: content.documentMessage.fileName || undefined,
-      bytes: Number(content.documentMessage.fileLength || 0),
-      ts: Number(m.messageTimestamp) || now()
-    } as MediaMeta)
-  : content.stickerMessage ? ({
-      id, jid, type: 'sticker',
-      mimetype: content.stickerMessage.mimetype,
-      bytes: Number(content.stickerMessage.fileLength || 0),
-      ts: Number(m.messageTimestamp) || now()
-    } as MediaMeta)
-  : null
+async function maybeDownloadMedia(wamessage: WAMessage) {
+  const m: any = wamessage.message || {};
+  const mediaEntry =
+    m.imageMessage || m.videoMessage || m.audioMessage ||
+    m.documentMessage || m.stickerMessage || null;
+  if (!mediaEntry) return null;
 
-  if (meta) rec.mediaIndex.set(id, meta)
+  try {
+    const buffer = await downloadMediaMessage(wamessage, 'buffer', {}, { logger });
+    const mt: string = mediaEntry.mimetype || 'application/octet-stream';
+    const ext = mime.extension(mt) || 'bin';
+    const fname = `${wamessage.key?.id}.${ext}`;
+    const fpath = path.join(MEDIA_DIR, fname);
+    fs.writeFileSync(fpath, buffer);
+    return { file: `/media/${fname}`, mimetype: mt, bytes: buffer.length };
+  } catch (e: any) {
+    logger.warn({ err: e?.message }, 'media download failed');
+    return { error: 'download_failed' as const };
+  }
 }
 
-async function makeDownloadUrl(sessionId: string, messageId: string) {
-  return `${PUBLIC_BASE_URL}/sessions/${encodeURIComponent(sessionId)}/media/${encodeURIComponent(messageId)}.bin?key=${encodeURIComponent(API_KEY)}`
-}
+async function startSock() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 
-async function pushWebhook(rec: SessionRec, m: WAMessage) {
-  if (!rec.webhook) return
-  const id = m.key.id, jid = m.key.remoteJid
-  if (!id || !jid) return
+  const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR);
 
-  const c = unwrapMsgContent(m)
-  const text = c.conversation || c.extendedTextMessage?.text || null
-  const media = rec.mediaIndex.get(id)
-  const mediaUrl = media ? await makeDownloadUrl(rec.id, id) : null
-
-  const payload = {
-    type: 'message',
-    sessionId: rec.id,
-    messageId: id,
-    chatId: jid,
-    fromMe: !!m.key.fromMe,
-    timestamp: Number(m.messageTimestamp) || now(),
-    text,
-    media: media ? {
-      kind: media.type,
-      mimetype: media.mimetype || null,
-      seconds: media.seconds || null,
-      bytes: media.bytes || null,
-      fileName: media.fileName || null,
-      url: mediaUrl
-    } : null
+  let version: [number, number, number] | undefined;
+  try {
+    const v = await fetchLatestBaileysVersion();
+    version = v.version;
+    logger.info({ version }, 'Using WhatsApp version');
+  } catch {
+    logger.warn('Could not fetch latest Baileys version — proceeding without pin.');
   }
 
-  fetch(rec.webhook, {
-    method: 'POST',
-    headers: { 'content-type':'application/json' },
-    body: JSON.stringify(payload)
-  }).catch(() => {})
-}
-
-/* ========= socket lifecycle ========= */
-
-async function startSocket(sessionId: string): Promise<SessionRec> {
-  const rec = ensureSessionRec(sessionId)
-  if (rec.sock) return rec
-
-  const authPath = path.join(AUTH_DIR, sessionId)
-  await fs.mkdir(authPath, { recursive: true })
-
-  const { state, saveCreds } = await useMultiFileAuthState(authPath)
-  const { version } = await fetchLatestBaileysVersion()
-
-  const sock = makeWASocket({
-    version,
+  sock = makeWASocket({
+    logger,
     auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    markOnlineOnConnect: false,
-    syncFullHistory: true
-  })
+    version,
+    // emulate desktop for fuller history sync per docs
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: true,
+    printQRInTerminal: true,
+    // enable reupload by fetching cached message if needed
+    getMessage: async (key) => {
+      if (!key?.remoteJid || !key?.id) return undefined;
+      const cached = findMessage(key.remoteJid, key.id);
+      return (cached?.raw as any) || undefined;
+    }
+  });
 
-  rec.sock = sock
-  rec.status = 'connecting'
-  rec.lastQR = null
-  rec.phone = null
+  sock.ev.on('creds.update', saveCreds);
 
-  // creds
-  sock.ev.on('creds.update', async () => {
-    if (rec.savingCreds) return
-    rec.savingCreds = true
-    try { await saveCreds() } finally { rec.savingCreds = false }
-  })
+  sock.ev.on('connection.update', (u) => {
+    const { connection, lastDisconnect, qr } = u as any;
+    if (qr) {
+      lastQR = qr;
+      emitEvent('qr', { qr: true });
+      logger.info('QR ready');
+    }
+    if (connection === 'open') {
+      connInfo.status = 'open';
+      lastQR = null;
+      emitEvent('status', { status: 'open' });
+      logger.info('WhatsApp connection OPEN');
+    } else if (connection === 'close') {
+      const code = (lastDisconnect as any)?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      connInfo.status = 'closed';
+      connInfo.reason = (lastDisconnect as any)?.error?.message || 'unknown';
+      emitEvent('status', { status: 'closed', reason: connInfo.reason });
+      logger.warn({ code }, 'Connection closed');
+      if (shouldReconnect) {
+        setTimeout(() => startSock().catch((e) => logger.error(e)), 1500);
+      } else {
+        logger.error('Logged out — rescan at /qr');
+      }
+    } else if (connection) {
+      connInfo.status = connection;
+      emitEvent('status', { status: connection });
+    }
+  });
 
-  // contacts/chats — cast en any pour contourner le mismatch de typings
-  ;(sock.ev as any).on('contacts.set', ({ contacts }: any) => {
-    rec.contacts.clear()
-    for (const [id, v] of Object.entries(contacts)) rec.contacts.set(id, v as Contact)
-  })
-  ;(sock.ev as any).on('contacts.upsert', (arr: any[]) => {
+  // Initial history set: contacts, chats, existing messages on device
+  sock.ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages }) => {
+    if (Array.isArray(newContacts)) {
+      for (const c of newContacts as any[]) {
+        if (!c?.id) continue;
+        contacts[c.id] = {
+          jid: c.id,
+          name: c.name || c.notify || c.verifiedName || null,
+          notify: c.notify || null,
+          verifiedName: c.verifiedName || null,
+          isBusiness: !!c.isBusiness
+        };
+      }
+      saveContacts();
+      emitEvent('contacts.sync', { count: Object.keys(contacts).length });
+    }
+
+    if (Array.isArray(newChats)) {
+      for (const ch of newChats as any[]) {
+        if (!ch?.id || isStatusJid(ch.id)) continue;
+        chats[ch.id] = {
+          jid: ch.id,
+          name: ch.name || contacts[ch.id]?.name || null,
+          unreadCount: ch.unreadCount || 0,
+          lastMsgTs: ch.conversationTimestamp || Date.now()
+        };
+      }
+      saveChats();
+      emitEvent('chats.sync', { count: Object.keys(chats).length });
+    }
+
+    if (Array.isArray(newMessages)) {
+      for (const m of newMessages as WAMessage[]) {
+        const jid = m.key?.remoteJid;
+        if (!jid || isStatusJid(jid)) continue;
+        const entry: StoredMessage = {
+          key: m.key || undefined,
+          pushName: (m as any).pushName || null,
+          timestamp: Number((m as any).messageTimestamp) * 1000 || Date.now(),
+          type: Object.keys(m.message || {})[0] || null,
+          text: extractText(m),
+          reactions: [],
+          raw: m
+        };
+        if (AUTO_DOWNLOAD_MEDIA) {
+          const media = await maybeDownloadMedia(m);
+          if (media) entry.media = media;
+        }
+        appendMessage(jid, entry);
+      }
+      emitEvent('messages.sync', { added: newMessages.length });
+    }
+  });
+
+  // Contacts & chats updates
+  sock.ev.on('contacts.upsert', (arr: any[]) => {
     for (const c of arr) {
-      const prev = rec.contacts.get(c.id) || {}
-      rec.contacts.set(c.id, { ...prev, ...c })
+      if (!c?.id) continue;
+      contacts[c.id] = {
+        jid: c.id,
+        name: c.name || c.notify || c.verifiedName || null,
+        notify: c.notify || null,
+        verifiedName: c.verifiedName || null,
+        isBusiness: !!c.isBusiness
+      };
     }
-  })
-  ;(sock.ev as any).on('chats.set', ({ chats }: any) => {
-    rec.chats.clear()
-    for (const c of chats) rec.chats.set(c.id, c as Chat)
-  })
+    saveContacts();
+    emitEvent('contacts.upsert', { count: arr.length });
+  });
+
+  sock.ev.on('contacts.update', (arr: any[]) => {
+    for (const c of arr) {
+      const prev = contacts[c.id] || { jid: c.id };
+      contacts[c.id] = {
+        ...prev,
+        name: c.name ?? prev.name,
+        notify: c.notify ?? prev.notify,
+        verifiedName: c.verifiedName ?? prev.verifiedName
+      };
+    }
+    saveContacts();
+    emitEvent('contacts.update', { count: arr.length });
+  });
+
   sock.ev.on('chats.upsert', (arr: any[]) => {
-    for (const c of arr) rec.chats.set(c.id, c as Chat)
-  })
-  sock.ev.on('chats.update', (arr: any[]) => {
-    for (const upd of arr) {
-      const prev = rec.chats.get(upd.id) || {}
-      rec.chats.set(upd.id, { ...prev, ...upd })
+    for (const ch of arr) {
+      if (!ch?.id || isStatusJid(ch.id)) continue;
+      chats[ch.id] = {
+        jid: ch.id,
+        name: ch.name || contacts[ch.id]?.name || null,
+        unreadCount: ch.unreadCount || 0,
+        lastMsgTs: ch.conversationTimestamp || Date.now()
+      };
     }
-  })
+    saveChats();
+    emitEvent('chats.upsert', { count: arr.length });
+  });
 
-  // message stream
-  sock.ev.on('messages.upsert', async (evt) => {
-    for (const m of evt.messages) {
-      try {
-        const jid = m.key.remoteJid!
-        const list = rec.messages.get(jid) || []
-        list.push(m)
-        if (list.length > 500) list.splice(0, list.length - 500)
-        rec.messages.set(jid, list)
+  sock.ev.on('chats.update', (arr: any[]) => {
+    for (const ch of arr) {
+      const prev = chats[ch.id] || { jid: ch.id };
+      chats[ch.id] = {
+        ...prev,
+        name: ch.name ?? prev.name,
+        unreadCount: ch.unreadCount ?? prev.unreadCount,
+        lastMsgTs: ch.conversationTimestamp ?? prev.lastMsgTs
+      };
+    }
+    saveChats();
+    emitEvent('chats.update', { count: arr.length });
+  });
 
-        indexMedia(rec, m)
-        await pushWebhook(rec, m)
-      } catch (e:any) {
-        log.warn({ err:e, sessionId, id:m.key.id }, 'messages.upsert handler failed')
+  sock.ev.on('chats.delete', (arr: string[]) => {
+    for (const id of arr) delete chats[id];
+    saveChats();
+    emitEvent('chats.delete', { count: arr.length });
+  });
+
+  // Real-time messages
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const m of messages as WAMessage[]) {
+      if (!m.message || (m.key as any).fromMe) continue;
+      const jid = m.key?.remoteJid;
+      if (!jid || isStatusJid(jid)) continue;
+
+      const entry: StoredMessage = {
+        key: m.key || undefined,
+        pushName: (m as any).pushName || null,
+        timestamp: Number((m as any).messageTimestamp) * 1000 || Date.now(),
+        type: Object.keys(m.message || {})[0] || null,
+        text: extractText(m),
+        reactions: [],
+        raw: m
+      };
+      if (AUTO_DOWNLOAD_MEDIA) {
+        const media = await maybeDownloadMedia(m);
+        if (media) entry.media = media;
+      }
+      appendMessage(jid, entry);
+      emitEvent('message.new', { jid, type: entry.type });
+
+      if (ECHO_REPLY && entry.text) {
+        try { await sock!.sendMessage(jid, { text: `Echo: ${entry.text}` }); } catch {}
       }
     }
-  })
+  });
 
-  // connection + QR
-  sock.ev.on('connection.update', (u) => {
-    const { connection, lastDisconnect, qr } = u
-    if (qr) rec.lastQR = { qr, ts: now() }
-
-    if (connection === 'open') {
-      rec.status = 'open'
-      rec.phone = sock.user?.id || null
-      log.info({ sessionId, phone: rec.phone }, 'session connected')
-    } else if (connection === 'close') {
-      const reason = (lastDisconnect as any)?.error?.message || 'unknown'
-      rec.status = 'close'
-      rec.phone = null
-      log.warn({ sessionId, reason }, 'session closed')
-    } else if (connection === 'connecting') {
-      rec.status = 'connecting'
+  // Reactions add/remove
+  // Note: some Baileys versions send reactions via messages.update; here we also subscribe to messages.reaction if present.
+  sock.ev.on('messages.reaction' as any, (arr: any[]) => {
+    for (const r of arr) {
+      const jid = r.key?.remoteJid;
+      const id = r.key?.id;
+      if (!jid || !id) continue;
+      const msg = findMessage(jid, id);
+      if (!msg) continue;
+      msg.reactions = msg.reactions || [];
+      msg.reactions.push({
+        from: r.key.participant || jid,
+        emoji: r.reaction?.text || '',
+        ts: Date.now()
+      });
+      appendMessage(jid, msg);
+      emitEvent('message.reaction', { jid, id, emoji: r.reaction?.text || '' });
     }
-  })
+  });
 
-  return rec
+  // Edits / deletes (we log; NDJSON append-only)
+  sock.ev.on('messages.update', (arr: any[]) => {
+    logger.debug({ count: arr.length }, 'messages.update');
+  });
+  sock.ev.on('messages.delete', (arr: any[]) => {
+    logger.debug({ count: arr.length }, 'messages.delete');
+  });
 }
 
-async function logoutSession(sessionId: string) {
-  const rec = ensureSessionRec(sessionId)
-  if (rec.sock) { try { await rec.sock.logout() } catch {} }
-  sessions.delete(sessionId)
-}
+// ---------- HTTP: health & basics ----------
+app.get('/health', (_req, res) => res.json({ ok: true, status: connInfo.status }));
+app.get('/me', (_req, res) => res.json({ status: connInfo.status, user: (sock as any)?.user || null }));
 
-/* ========= http server ========= */
-
-const app = express()
-app.use(cors())
-app.use(express.json())
-
-app.get('/health', (_req, res) => res.json({ ok: true }))
-
-// create/ensure session
-app.post('/sessions', authz, async (req, res) => {
-  try {
-    const id = String(req.body?.sessionId || '').trim()
-    if (!id) return res.status(400).json({ error: 'sessionId required' })
-    const rec = await startSocket(id)
-    return res.json({
-      ok: true,
-      sessionId: rec.id,
-      status: rec.status === 'open' ? 'connected' : rec.status,
-      isConnected: rec.status === 'open',
-      phoneNumber: rec.phone || null,
-      counts: { chats: rec.chats.size, contacts: rec.contacts.size },
-      qrAvailable: !!(rec.lastQR && now() - rec.lastQR.ts < QR_TTL_MS)
-    })
-  } catch (e:any) {
-    log.error({ err:e }, 'start session failed')
-    return res.status(500).json({ error: e?.message || 'start-failed' })
+// QR HTML (auto refresh)
+app.get('/qr', async (_req, res) => {
+  if (!lastQR) {
+    const msg = connInfo.status === 'open' ? 'Déjà lié ✅' : 'QR pas encore prêt — recharge dans 3 s';
+    return res.send(`<html><meta http-equiv="refresh" content="3"><body style="font-family:system-ui"><h1>${msg}</h1><p>Status: ${connInfo.status}</p></body></html>`);
   }
-})
+  const dataUrl = await qrcode.toDataURL(lastQR, { margin: 1, scale: 8 });
+  res.send(`
+    <html><head><meta http-equiv="refresh" content="15"></head>
+      <body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;flex-direction:column;gap:16px">
+        <h2>Scanne avec WhatsApp</h2>
+        <img src="${dataUrl}" alt="QR" />
+        <p>Status: ${connInfo.status}</p>
+      </body>
+    </html>
+  `);
+});
 
-// session status
-app.get('/sessions/:id', authz, (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  return res.json({
-    ok: true,
-    sessionId: rec.id,
-    status: rec.status === 'open' ? 'connected' : rec.status,
-    isConnected: rec.status === 'open',
-    me: rec.phone ? { id: rec.phone } : undefined,
-    phoneNumber: rec.phone || null,
-    counts: { chats: rec.chats.size, contacts: rec.contacts.size },
-    qrAvailable: !!(rec.lastQR && now() - rec.lastQR.ts < QR_TTL_MS)
-  })
-})
+// ---------- Static media ----------
+app.use('/media', express.static(MEDIA_DIR));
 
-// logout
-app.post('/sessions/:id/logout', authz, async (req, res) => {
-  await logoutSession(req.params.id)
-  return res.json({ ok: true, sessionId: req.params.id, status: 'disconnected' })
-})
+// ---------- Contacts / Chats / Messages ----------
+app.get('/contacts', (req, res) => {
+  const q = (req.query.q || '').toString().toLowerCase();
+  const all = Object.values(contacts);
+  const filtered = q
+    ? all.filter(c => (c.name || '').toLowerCase().includes(q) || (c.jid || '').includes(q))
+    : all;
+  res.json({ count: filtered.length, contacts: filtered });
+});
 
-// per-session QR
-app.get('/sessions/:id/qr', authz, (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const entry = rec.lastQR && (now() - rec.lastQR.ts < QR_TTL_MS) ? rec.lastQR : null
-  if (!entry) return res.status(404).json({ error: 'no-qr-available', sessionId: rec.id })
-  return res.json({ sessionId: rec.id, qr: entry.qr, qrAt: entry.ts })
-})
-app.get('/sessions/:id/qr.png', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const entry = rec.lastQR && (now() - rec.lastQR.ts < QR_TTL_MS) ? rec.lastQR : null
-  if (!entry) return res.status(404).json({ error: 'no-qr-available', sessionId: rec.id })
-  const png = await QRCode.toBuffer(entry.qr, { errorCorrectionLevel: 'M', margin: 1, width: 512 })
-  res.setHeader('Content-Type', 'image/png')
-  res.send(png)
-})
-// legacy global QR for default
-app.get('/qr', authz, (req, res) => {
-  const rec = ensureSessionRec('default')
-  const entry = rec.lastQR && (now() - rec.lastQR.ts < QR_TTL_MS) ? rec.lastQR : null
-  if (!entry) return res.status(404).json({ error: 'no-qr-available', sessionId: rec.id })
-  return res.json({ sessionId: rec.id, qr: entry.qr, qrAt: entry.ts })
-})
+app.get('/chats', (_req, res) => {
+  res.json({ count: Object.keys(chats).length, chats: Object.values(chats) });
+});
 
-// pairing code
-app.post('/sessions/:id/pairing-code', authz, async (req, res) => {
+app.get('/messages', (req, res) => {
+  const jid = (req.query.jid || '').toString();
+  if (!jid) return res.status(400).json({ error: 'jid is required' });
+  const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
+  const before = req.query.before ? parseInt(req.query.before as string, 10) : null;
+  const items = readMessages(jid, limit, before ?? undefined);
+  res.json({ jid, count: items.length, messages: items });
+});
+
+// ---------- Senders ----------
+app.post('/send-text', async (req, res) => {
   try {
-    const id = req.params.id
-    const phone = String(req.body?.phoneNumber || '').trim()
-    const custom = req.body?.custom ? String(req.body.custom) : undefined
-    if (!phone) return res.status(400).json({ error: 'phoneNumber required' })
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+    const { to, text } = req.body || {};
+    if (!to || !text) return res.status(400).json({ error: 'to and text are required' });
+    const jid = to.includes('@') ? to : `${String(to).replace(/\D/g, '')}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text });
+    res.json({ ok: true, to: jid });
+  } catch (e: any) {
+    logger.error(e, 'send-text failed');
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    const rec = await startSocket(id)
-    const sock = rec.sock!
-    // @ts-ignore (exposé selon versions)
-    if (typeof sock.requestPairingCode !== 'function') {
-      return res.status(501).json({ error: 'pairing-code-not-supported' })
+// Optional: send image via URL or dataUrl
+app.post('/send-image', async (req, res) => {
+  try {
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+    const { to, url, dataUrl, caption } = req.body || {};
+    if (!to || (!url && !dataUrl)) return res.status(400).json({ error: 'to and (url or dataUrl) required' });
+    const jid = to.includes('@') ? to : `${String(to).replace(/\D/g, '')}@s.whatsapp.net`;
+
+    if (url) {
+      await sock.sendMessage(jid, { image: { url }, caption });
+    } else {
+      // dataUrl: "data:image/png;base64,...."
+      const base64 = String(dataUrl).split(',')[1] || dataUrl;
+      const bin = Buffer.from(base64, 'base64');
+      await sock.sendMessage(jid, { image: bin, caption });
     }
-    // @ts-ignore
-    const code: string = await sock.requestPairingCode(phone, custom)
-    return res.json({ sessionId: id, pairingCode: code })
-  } catch (e:any) {
-    log.error({ err:e }, 'pairing failed')
-    return res.status(500).json({ error: e?.message || 'pairing-failed' })
+    res.json({ ok: true, to: jid });
+  } catch (e: any) {
+    logger.error(e, 'send-image failed');
+    res.status(500).json({ error: e.message });
   }
-})
+});
 
-// webhook par session
-app.post('/sessions/:id/webhook', authz, (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const url = String(req.body?.url || '').trim()
-  if (!url) return res.status(400).json({ error: 'url required' })
-  rec.webhook = url
-  return res.json({ ok:true, sessionId: rec.id, webhook: url })
-})
-
-/* ===== contacts / chats / pp ===== */
-app.get('/sessions/:id/contacts', authz, (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  res.json({ ok:true, contacts: Array.from(rec.contacts.values()) })
-})
-app.get('/sessions/:id/chats', authz, (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  res.json({ ok:true, chats: Array.from(rec.chats.values()) })
-})
-app.get('/sessions/:id/profile-picture', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const jid = String(req.query.jid || '')
-  if (!jid) return res.status(400).json({ error: 'jid required' })
+// React to a message: { jid, id, emoji }
+app.post('/react', async (req, res) => {
   try {
-    const pp = await rec.sock!.profilePictureUrl(jid, 'image')
-    res.json({ ok:true, jid, url: pp })
-  } catch (e:any) {
-    res.status(500).json({ error: e?.message || 'pp-failed' })
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+    const { jid, id, emoji } = req.body || {};
+    if (!jid || !id || !emoji) return res.status(400).json({ error: 'jid, id, emoji are required' });
+    const original = findMessage(jid, id);
+    if (!original?.key) return res.status(404).json({ error: 'message not found' });
+    await sock.sendMessage(jid, { react: { text: emoji, key: original.key! } });
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
-})
+});
 
-/* ===== messages ===== */
-app.get('/sessions/:id/messages/recent', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const jid = String(req.query.jid || '')
-  const count = Math.max(1, Math.min(100, Number(req.query.count || 25)))
-  if (!jid) return res.status(400).json({ error: 'jid required' })
-  const list = rec.messages.get(jid) || []
-  const sorted = [...list].sort((a,b) => Number(a.messageTimestamp||0) - Number(b.messageTimestamp||0))
-  res.json({ ok:true, jid, messages: sorted.slice(-count) })
-})
-
-// naive history fetch (anchor-based)
-app.get('/sessions/:id/messages/history', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const jid = String(req.query.jid || '')
-  const count = Math.max(1, Math.min(50, Number(req.query.count || 25)))
-  if (!jid) return res.status(400).json({ error: 'jid required' })
-
-  const have = rec.messages.get(jid) || []
-  const oldest = [...have].sort((a,b) => Number(a.messageTimestamp||0) - Number(b.messageTimestamp||0))[0]
-  if (!oldest) return res.status(404).json({ error: 'no-anchor' })
+// ---------- Profile pictures ----------
+app.get('/profile-pic', async (req, res) => {
   try {
-    // @ts-ignore — selon version
-    await rec.sock!.fetchMessageHistory(count, oldest.key, oldest.messageTimestamp)
-    res.json({ ok:true, requested: count })
-  } catch (e:any) {
-    res.status(500).json({ error: e?.message || 'history-fetch-failed' })
+    if (!sock) return res.status(503).json({ error: 'Socket not ready' });
+    const jid = (req.query.jid || '').toString();
+    if (!jid) return res.status(400).json({ error: 'jid is required' });
+    const picUrl = await sock.profilePictureUrl(jid, 'image').catch(() => null);
+    res.json({ jid, url: picUrl });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
-})
+});
 
-/* ===== media download (all kinds) ===== */
-app.get('/sessions/:id/media/:messageId.bin', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const mid = req.params.messageId
+// ---------- SSE: live events (QR/status/counts) ----------
+app.get('/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
 
-  let found: WAMessage | undefined
-  for (const [, arr] of rec.messages) {
-    const hit = arr.find(x => x.key.id === mid)
-    if (hit) { found = hit; break }
-  }
-  if (!found) return res.status(404).json({ error: 'message-not-found' })
+  const listener = (evt: any) => {
+    res.write(`event: ${evt.type}\n`);
+    res.write(`data: ${JSON.stringify(evt.payload)}\n\n`);
+  };
+  bus.on('evt', listener);
 
-  try {
-    const buf = await downloadMediaMessage(
-      // @ts-ignore accepts WAMessage/IMessage
-      found, 'buffer', { startByte: 0 },
-      { reuploadRequest: rec.sock!.updateMediaMessage, logger: log as any }
-    )
+  // initial state
+  res.write(`event: hello\n`);
+  res.write(`data: ${JSON.stringify({ status: connInfo.status, qr: !!lastQR })}\n\n`);
 
-    const c = unwrapMsgContent(found)
-    const mime =
-      c.imageMessage?.mimetype ||
-      c.videoMessage?.mimetype ||
-      c.audioMessage?.mimetype ||
-      c.documentMessage?.mimetype ||
-      c.stickerMessage?.mimetype ||
-      'application/octet-stream'
+  req.on('close', () => {
+    bus.off('evt', listener);
+    res.end();
+  });
+});
 
-    res.setHeader('Content-Type', mime)
-    res.setHeader('Cache-Control', 'private, max-age=60')
-    res.send(buf)
-  } catch (e:any) {
-    res.status(500).json({ error: e?.message || 'media-download-failed' })
-  }
-})
+// ---------- Boot ----------
+(async () => {
+  await startSock();
+  app.listen(PORT, () => logger.info(`HTTP server listening on :${PORT}`));
+})();
 
-/* ===== send helper ===== */
-app.post('/sessions/:id/send', authz, async (req, res) => {
-  const rec = ensureSessionRec(req.params.id)
-  const { jid, text, imageUrl, videoUrl, audioUrl, documentUrl, caption, mimetype } = req.body || {}
-  if (!jid) return res.status(400).json({ error: 'jid required' })
-  try {
-    const msg = imageUrl ? { image: { url: imageUrl }, caption } :
-                videoUrl ? { video: { url: videoUrl }, caption } :
-                audioUrl ? { audio: { url: audioUrl }, mimetype: mimetype || 'audio/ogg; codecs=opus' } :
-                documentUrl ? { document: { url: documentUrl }, mimetype: mimetype || 'application/pdf', caption } :
-                { text: text || '' }
-    const resp = await rec.sock!.sendMessage(jid, msg)
-    res.json({ ok:true, response: resp })
-  } catch (e:any) {
-    res.status(500).json({ error: e?.message || 'send-failed' })
-  }
-})
-
-/* ===== boot ===== */
-async function boot() {
-  await ensureDirs()
-  const PORT = Number(process.env.PORT || 3001)
-  app.listen(PORT, () => {
-    log.info({ DATA_DIR, AUTH_DIR, MEDIA_DIR }, 'paths ready')
-    log.info(`HTTP listening on :${PORT}`)
-    // démarrage de la session 'default' pour compat /qr
-    startSocket('default').catch(err => log.warn({ err }, 'default session start failed'))
-  })
-}
-boot()
+// Graceful stop
+process.on('SIGTERM', () => logger.info('SIGTERM received'));
