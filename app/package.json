@@ -10,15 +10,15 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "@whiskeysockets/baileys": "6.7.21",
-		"@rodrigogs/baileys-store": "^1.0.1",
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "pino": "^9.3.1",
-    "dotenv": "^16.4.5",
-    "@hapi/boom": "^10.0.1"
-  },
+"dependencies": {
+  "@whiskeysockets/baileys": "6.7.21",
+  "@rodrigogs/baileys-store": "^1.0.1",
+  "express": "^4.19.2",
+  "cors": "^2.8.5",
+  "pino": "^9.3.1",
+  "dotenv": "^16.4.5",
+  "@hapi/boom": "^10.0.1"
+},
   "devDependencies": {
     "typescript": "^5.6.3",
     "@types/node": "^20.12.12",
