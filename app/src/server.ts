@@ -13,9 +13,6 @@ import {
   WAMessageKey,
   jidDecode,
   proto,
-  // Types récents Baileys
-  IMessage,
-  IMessageKey,
 } from '@whiskeysockets/baileys'
 import fs from 'fs'
 import fsp from 'fs/promises'
@@ -42,14 +39,12 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 let sock: WASocket | null = null
 const AUTH_DIR = path.join(process.cwd(), 'auth')
 
-// in-memory
 type Contact = { id: string; name?: string; notify?: string; verifiedName?: string; isBusiness?: boolean }
 type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: number }
 
 const contactsMap = new Map<string, Contact>()
 const chatsMap    = new Map<string, Chat>()
-// on garde volontairement any pour rester compatible avec les changements de types Baileys
-const msgMap      = new Map<string, any[]>() // par jid, derniers messages
+const msgMap      = new Map<string, any[]>() // messages par JID (web messages entiers)
 
 const MSG_CAP = 200
 let currentQR: string | null = null
@@ -93,17 +88,16 @@ async function connectWA() {
     markOnlineOnConnect: false,
     syncFullHistory: false,
     shouldIgnoreJid: () => false,
-    // Adapter la signature aux derniers types IMessage/IMessageKey
-    getMessage: async (key: IMessageKey): Promise<IMessage | undefined> => {
+    // Baileys attend le "message content" -> proto.IMessage
+    getMessage: async (key: WAMessageKey): Promise<proto.IMessage | undefined> => {
       const jid = key.remoteJid || ''
       const arr = msgMap.get(jid) || []
       const found = arr.find((m: any) => m?.key?.id === key.id)
-      return (found as unknown as IMessage) ?? undefined
+      return (found?.message as proto.IMessage) ?? undefined
     },
   })
 
-  // on typage-relax "any" pour rester compatibles avec les nouvelles versions
-  const ev: any = sock.ev
+  const ev: any = sock.ev // relâche le typage pour suivre les changements Baileys
 
   /* ---------- persist creds ---------- */
   ev.on('creds.update', saveCreds)
@@ -121,13 +115,15 @@ async function connectWA() {
       })
     }
   })
+
   ev.on('contacts.update', (updates: any[]) => {
     for (const u of updates || []) {
       if (!u?.id) continue
       const prev = contactsMap.get(u.id) || { id: u.id }
-      contactsMap.set(u.id, { ...prev, ...u })
+      contactsMap.set(u.id, { ...(prev as Contact), ...(u as Partial<Contact>) })
     }
   })
+
   ev.on('chats.set', ({ chats, isLatest }: any) => {
     for (const c of chats || []) {
       chatsMap.set(c.id, {
@@ -135,10 +131,11 @@ async function connectWA() {
         name: c.name,
         unreadCount: c.unreadCount,
         lastMsgTs: c.lastMsgRecv,
-      })
+      } as Chat)
     }
     logger.info({ count: (chats || []).length, isLatest }, 'chats.set')
   })
+
   ev.on('chats.upsert', (chs: any[]) => {
     for (const c of chs || []) {
       chatsMap.set(c.id, {
@@ -146,13 +143,14 @@ async function connectWA() {
         name: c.name,
         unreadCount: c.unreadCount,
         lastMsgTs: c.lastMsgRecv,
-      })
+      } as Chat)
     }
   })
+
   ev.on('chats.update', (chs: any[]) => {
     for (const c of chs || []) {
-      const prev = chatsMap.get(c.id) || { jid: c.id }
-      chatsMap.set(c.id, { ...prev, name: c.name ?? prev.name })
+      const prev = (chatsMap.get(c.id) as Chat) || ({ jid: c.id } as Chat)
+      chatsMap.set(c.id, { ...prev, name: (c.name ?? prev.name) } as Chat)
     }
   })
 
@@ -161,9 +159,11 @@ async function connectWA() {
     for (const m of messages || []) pushMessage(m)
     logger.info({ chats: (chats || []).length, messages: (messages || []).length, isLatest }, 'messages.set')
   })
+
   ev.on('messages.upsert', ({ messages }: any) => {
     for (const m of messages || []) pushMessage(m)
   })
+
   ev.on('messages.update', (updates: any[]) => {
     for (const u of updates || []) {
       const jid = u?.key?.remoteJid || ''
@@ -193,9 +193,9 @@ async function connectWA() {
 
     if (connection === 'close') {
       const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
-      logger.warn({ code, reason: DisconnectReason[code as any] }, 'connection closed')
+      logger.warn({ code, reason: (DisconnectReason as any)[code || ''] }, 'connection closed')
 
-      // 515 = restart required -> reconnect sans wipe
+      // 515 -> restart required (pas d’effacement d’auth)
       if (code === 515 || code === DisconnectReason.restartRequired) {
         logger.warn('Restart required — reconnecting (no auth reset)')
         setTimeout(connectWA, 500)
@@ -209,7 +209,7 @@ async function connectWA() {
         return
       }
 
-      // autres -> tentative de reconnexion
+      // autres cas -> reconnexion simple
       setTimeout(connectWA, 1000)
     }
   })
