@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import qrcode from 'qrcode';
 import mime from 'mime-types';
+import * as crypto from 'crypto';
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -22,6 +23,9 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data-auth');
 const AUTO_DOWNLOAD_MEDIA = process.env.AUTO_DOWNLOAD_MEDIA === '1';
 const ECHO_REPLY = process.env.ECHO_REPLY === '1';
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+const WEBHOOK_OUTBOX_URL = process.env.WEBHOOK_OUTBOX_URL || '';
+const WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET || '';
 
 // ---------- Logger ----------
 const logger = pino({ level: LOG_LEVEL });
@@ -107,11 +111,28 @@ let sock: ReturnType<typeof makeWASocket> | null = null;
 let lastQR: string | null = null;
 let connInfo: { status: string; reason?: string } = { status: 'starting' };
 
+// ---------- Events bus + webhooks ----------
 const bus = new EventEmitter();
-function emitEvent(type: string, payload: any) {
-  bus.emit('evt', { type, payload, t: Date.now() });
+
+function postWebhook(evt: any) {
+  if (!WEBHOOK_OUTBOX_URL) return;
+  const json = JSON.stringify(evt);
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (WEBHOOK_SIGNING_SECRET) {
+    const sig = crypto.createHmac('sha256', WEBHOOK_SIGNING_SECRET).update(json).digest('hex');
+    headers['x-signature'] = sig;
+  }
+  // fire-and-forget
+  fetch(WEBHOOK_OUTBOX_URL, { method: 'POST', headers, body: json }).catch(() => {});
 }
 
+function emitEvent(type: string, payload: any) {
+  const evt = { type, payload, t: Date.now() };
+  bus.emit('evt', evt);
+  postWebhook(evt);
+}
+
+// ---------- Helpers ----------
 function extractText(msg?: WAMessage): string | null {
   const m = msg?.message as any;
   if (!m) return null;
@@ -128,6 +149,7 @@ function extractText(msg?: WAMessage): string | null {
 }
 function isStatusJid(jid?: string | null) { return jid === 'status@broadcast'; }
 
+// ---------- Media ----------
 async function maybeDownloadMedia(wamessage: WAMessage) {
   const m: any = wamessage.message || {};
   const mediaEntry =
@@ -149,6 +171,7 @@ async function maybeDownloadMedia(wamessage: WAMessage) {
   }
 }
 
+// ---------- Boot WA socket ----------
 async function startSock() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -167,11 +190,9 @@ async function startSock() {
     logger,
     auth: state,
     version,
-    // emulate desktop for fuller history sync per docs
     browser: Browsers.macOS('Desktop'),
     syncFullHistory: true,
     printQRInTerminal: true,
-    // enable reupload by fetching cached message if needed
     getMessage: async (key) => {
       if (!key?.remoteJid || !key?.id) return undefined;
       const cached = findMessage(key.remoteJid, key.id);
@@ -211,7 +232,7 @@ async function startSock() {
     }
   });
 
-  // Initial history set: contacts, chats, existing messages on device
+  // Initial history set
   sock.ev.on('messaging-history.set', async ({ chats: newChats, contacts: newContacts, messages: newMessages }) => {
     if (Array.isArray(newContacts)) {
       for (const c of newContacts as any[]) {
@@ -359,7 +380,6 @@ async function startSock() {
   });
 
   // Reactions add/remove
-  // Note: some Baileys versions send reactions via messages.update; here we also subscribe to messages.reaction if present.
   sock.ev.on('messages.reaction' as any, (arr: any[]) => {
     for (const r of arr) {
       const jid = r.key?.remoteJid;
@@ -378,13 +398,19 @@ async function startSock() {
     }
   });
 
-  // Edits / deletes (we log; NDJSON append-only)
-  sock.ev.on('messages.update', (arr: any[]) => {
-    logger.debug({ count: arr.length }, 'messages.update');
-  });
-  sock.ev.on('messages.delete', (arr: any[]) => {
-    logger.debug({ count: arr.length }, 'messages.delete');
-  });
+  // Edits / deletes (log only)
+  sock.ev.on('messages.update', (arr: any[]) => logger.debug({ count: arr.length }, 'messages.update'));
+  sock.ev.on('messages.delete', (arr: any[]) => logger.debug({ count: arr.length }, 'messages.delete'));
+}
+
+// ---------- Auth middleware (Bearer) ----------
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!AUTH_TOKEN) return next(); // pas d’auth en dev si vide
+  const hdr = req.get('authorization') || '';
+  if (!hdr.startsWith('Bearer ')) return res.status(401).json({ error: 'missing bearer token' });
+  const token = hdr.slice('Bearer '.length);
+  if (token !== AUTH_TOKEN) return res.status(403).json({ error: 'invalid token' });
+  return next();
 }
 
 // ---------- HTTP: health & basics ----------
@@ -412,8 +438,8 @@ app.get('/qr', async (_req, res) => {
 // ---------- Static media ----------
 app.use('/media', express.static(MEDIA_DIR));
 
-// ---------- Contacts / Chats / Messages ----------
-app.get('/contacts', (req, res) => {
+// ---------- Contacts / Chats / Messages (protégés si AUTH_TOKEN défini) ----------
+app.get('/contacts', requireAuth, (req, res) => {
   const q = (req.query.q || '').toString().toLowerCase();
   const all = Object.values(contacts);
   const filtered = q
@@ -422,11 +448,11 @@ app.get('/contacts', (req, res) => {
   res.json({ count: filtered.length, contacts: filtered });
 });
 
-app.get('/chats', (_req, res) => {
+app.get('/chats', requireAuth, (_req, res) => {
   res.json({ count: Object.keys(chats).length, chats: Object.values(chats) });
 });
 
-app.get('/messages', (req, res) => {
+app.get('/messages', requireAuth, (req, res) => {
   const jid = (req.query.jid || '').toString();
   if (!jid) return res.status(400).json({ error: 'jid is required' });
   const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
@@ -436,7 +462,7 @@ app.get('/messages', (req, res) => {
 });
 
 // ---------- Senders ----------
-app.post('/send-text', async (req, res) => {
+app.post('/send-text', requireAuth, async (req, res) => {
   try {
     if (!sock) return res.status(503).json({ error: 'Socket not ready' });
     const { to, text } = req.body || {};
@@ -450,8 +476,7 @@ app.post('/send-text', async (req, res) => {
   }
 });
 
-// Optional: send image via URL or dataUrl
-app.post('/send-image', async (req, res) => {
+app.post('/send-image', requireAuth, async (req, res) => {
   try {
     if (!sock) return res.status(503).json({ error: 'Socket not ready' });
     const { to, url, dataUrl, caption } = req.body || {};
@@ -461,7 +486,6 @@ app.post('/send-image', async (req, res) => {
     if (url) {
       await sock.sendMessage(jid, { image: { url }, caption });
     } else {
-      // dataUrl: "data:image/png;base64,...."
       const base64 = String(dataUrl).split(',')[1] || dataUrl;
       const bin = Buffer.from(base64, 'base64');
       await sock.sendMessage(jid, { image: bin, caption });
@@ -474,7 +498,7 @@ app.post('/send-image', async (req, res) => {
 });
 
 // React to a message: { jid, id, emoji }
-app.post('/react', async (req, res) => {
+app.post('/react', requireAuth, async (req, res) => {
   try {
     if (!sock) return res.status(503).json({ error: 'Socket not ready' });
     const { jid, id, emoji } = req.body || {};
@@ -489,7 +513,7 @@ app.post('/react', async (req, res) => {
 });
 
 // ---------- Profile pictures ----------
-app.get('/profile-pic', async (req, res) => {
+app.get('/profile-pic', requireAuth, async (req, res) => {
   try {
     if (!sock) return res.status(503).json({ error: 'Socket not ready' });
     const jid = (req.query.jid || '').toString();
@@ -506,7 +530,7 @@ app.get('/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders?.();
+  (res as any).flushHeaders?.();
 
   const listener = (evt: any) => {
     res.write(`event: ${evt.type}\n`);
