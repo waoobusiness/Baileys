@@ -1,6 +1,6 @@
 // src/server.ts
 import 'dotenv/config'
-import express, { Request, Response } from 'express'
+import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import pino from 'pino'
 import { Boom } from '@hapi/boom'
@@ -11,404 +11,348 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   WAMessageKey,
-  jidDecode
+  jidDecode,
+  proto
 } from '@whiskeysockets/baileys'
-
-// ✅ import explicite du store (compatible 6.7.x)
-import { makeInMemoryStore } from '@rodrigogs/baileys-store'
-
 import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
 
-// ============ CONFIG ============
-const PORT = Number(process.env.PORT || 10000)
-const AUTH_TOKEN = (process.env.AUTH_TOKEN || '').trim()
-const DATA_DIR = process.env.DATA_DIR || '/data/wa-auth'
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
-const AUTO_DOWNLOAD_MEDIA = (process.env.AUTO_DOWNLOAD_MEDIA || '0') === '1'
-
-const logger = pino({ level: LOG_LEVEL })
-
-// ============ EXPRESS ============
+/* ------------------------- logger & app ------------------------- */
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
-app.use(express.urlencoded({ extended: true }))
 
-// -------- auth middleware (Bearer) --------
-function requireAuth(req: Request, res: Response, next: Function) {
-  if (!AUTH_TOKEN) return res.status(500).json({ error: 'AUTH_TOKEN not set' })
-  const h = req.headers.authorization || ''
-  const token = h.startsWith('Bearer ') ? h.slice(7) : ''
-  if (token !== AUTH_TOKEN) return res.status(403).json({ error: 'forbidden' })
+/* --------------------------- security -------------------------- */
+const AUTH_TOKEN = process.env.AUTH_TOKEN || 'MY_PRIVATE_FURIA_API_KEY_2025'
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const hdr = (req.headers['authorization'] || '').toString()
+  const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
+  if (!got || got !== AUTH_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'forbidden' })
+  }
   next()
 }
 
-// ============ STATE ============
-let sock: WASocket | undefined
-const store = makeInMemoryStore({ logger })
+/* ------------------------ WA in-memory data --------------------- */
+let sock: WASocket | null = null
+const AUTH_DIR = path.join(process.cwd(), 'auth')
 
-// SSE state (QR + status)
-let lastQR: string | null = null
-let lastStatus: string = 'closed'
-const sseClients = new Set<Response>()
-function sseBroadcast(payload: any) {
-  const data = `data: ${JSON.stringify(payload)}\n\n`
-  for (const res of sseClients) {
-    try { res.write(data) } catch {}
-  }
+// contacts/chats/messages — ultra-simple in-memory store
+type Contact = { id: string; name?: string; notify?: string; verifiedName?: string; isBusiness?: boolean }
+type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: number }
+
+const contactsMap = new Map<string, Contact>()
+const chatsMap    = new Map<string, Chat>()
+const msgMap      = new Map<string, proto.IWebMessageInfo[]>() // by jid, keep last N
+
+const MSG_CAP = 200
+let currentQR: string | null = null
+let qrStatus: 'idle' | 'pending' | 'open' | 'closed' = 'idle'
+
+/* --------------------------- helpers ---------------------------- */
+function toJid(input: string): string {
+  if (!input) throw new Error('destination manquante')
+  const s = input.trim()
+  if (s.endsWith('@s.whatsapp.net') || s.endsWith('@g.us')) return s
+  const num = s.replace(/\D/g, '')
+  if (!num) throw new Error('numéro invalide')
+  return `${num}@s.whatsapp.net`
 }
 
-// Helpers
-function jidNormalize(input: string) {
-  if (!input) return input
-  if (input.includes('@')) return input
-  return `${String(input).replace(/\D/g, '')}@s.whatsapp.net`
+function pushMessage(m: proto.IWebMessageInfo) {
+  const jid = m.key?.remoteJid || ''
+  if (!jid) return
+  const arr = msgMap.get(jid) || []
+  arr.push(m)
+  if (arr.length > MSG_CAP) arr.splice(0, arr.length - MSG_CAP)
+  msgMap.set(jid, arr)
 }
 
-function messageToText(m: any): { type: string; text?: string } {
-  if (!m?.message) return { type: 'unknown' }
-  const msg = m.message
-  if (msg.conversation) return { type: 'conversation', text: msg.conversation }
-  if (msg.extendedTextMessage?.text) return { type: 'extendedText', text: msg.extendedTextMessage.text }
-  if (msg.imageMessage?.caption) return { type: 'image', text: msg.imageMessage.caption }
-  if (msg.videoMessage?.caption) return { type: 'video', text: msg.videoMessage.caption }
-  if (msg.documentMessage?.title) return { type: 'document', text: msg.documentMessage.title }
-  if (msg.audioMessage) return { type: 'audio' }
-  if (msg.stickerMessage) return { type: 'sticker' }
-  return { type: Object.keys(msg)[0] || 'unknown' }
+async function resetAuthFolder() {
+  try { await fsp.rm(AUTH_DIR, { recursive: true, force: true }) } catch {}
+  await fsp.mkdir(AUTH_DIR, { recursive: true })
 }
 
-function fromCodePointsHex(hex: string) {
-  const parts = hex.trim().split(/\s+/).map(h => parseInt(h, 16))
-  return String.fromCodePoint(...parts)
-}
-function normalizeEmoji(e?: string, hex?: string) {
-  if (hex && hex.trim()) return fromCodePointsHex(hex)
-  if (!e || !e.trim()) return '👍'
-  if (e === '❤') return '❤️'
-  if (e === '✔') return '✔️'
-  return e
-}
-
-// ============ START / RESET SOCKET ============
-
-async function bindSockEvents(sock: WASocket, saveCreds: () => Promise<void>) {
-  store.bind(sock.ev)
-
-  // QR & connection updates
-  sock.ev.on('connection.update', async (u: any) => {
-    const { connection, lastDisconnect, qr } = u
-
-    if (qr) {
-      lastQR = qr
-      sseBroadcast({ type: 'qr', qr })
-      logger.info('QR ready')
-    }
-
-    if (connection) {
-      lastStatus = connection
-      sseBroadcast({ type: 'status', status: connection })
-      logger.info({ msg: `connection: ${connection}` })
-    }
-
-    if (connection === 'close') {
-      const err = (lastDisconnect?.error || {}) as Boom<any>
-      // @ts-ignore
-      const code = (err as any)?.output?.statusCode || (err as any)?.statusCode || (err as any)?.code
-      const reason = (err as any)?.message || ''
-      const loggedOut =
-        code === DisconnectReason.loggedOut ||
-        code === 401 ||
-        reason.includes('logged out') ||
-        reason.includes('device_removed')
-
-      logger.warn({ code, reason }, 'connection close')
-
-      // Reset auth + restart so that /qr repropose un nouveau QR
-      await resetAuthAndRestart()
-    }
-    if (connection === 'open') {
-      lastQR = null
-      sseBroadcast({ type: 'ready' })
-      logger.info('WhatsApp connection OPEN')
-    }
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-
-  // messages
-  sock.ev.on('messages.upsert', async (ev: any) => {
-    if (ev.type !== 'notify') return
-    if (!AUTO_DOWNLOAD_MEDIA) return
-    // (on garde simple; pas de download automatique ici pour éviter les 403 flood)
-  })
-}
-
-async function startSock() {
-  await fsp.mkdir(DATA_DIR, { recursive: true })
-  const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR)
+/* ----------------------- WA connection flow --------------------- */
+async function connectWA() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
   const { version } = await fetchLatestBaileysVersion()
+  logger.info({ version }, 'Using WhatsApp version')
 
   sock = makeWASocket({
     version,
-    auth: state,
     printQRInTerminal: false,
     browser: ['Zuria.AI', 'Chrome', '1.0.0'],
-    logger
+    auth: state,
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+    shouldIgnoreJid: () => false,
+    getMessage: async (key: WAMessageKey) => {
+      const arr = msgMap.get(key.remoteJid || '') || []
+      const found = arr.find(m => m.key?.id === key.id)
+      return found ?? undefined
+    }
   })
 
-  logger.info({ version }, 'Using WhatsApp version')
-  bindSockEvents(sock, saveCreds)
+  /* ---------- persist creds ---------- */
+  sock.ev.on('creds.update', saveCreds)
+
+  /* ---------- contacts/chats bootstrap ---------- */
+  sock.ev.on('contacts.set', ({ contacts }) => {
+    for (const c of contacts) {
+      if (!c?.id) continue
+      contactsMap.set(c.id, {
+        id: c.id,
+        name: c.name,
+        notify: (c as any).notify,
+        verifiedName: (c as any).verifiedName,
+        isBusiness: (c as any).isBusiness
+      })
+    }
+  })
+  sock.ev.on('contacts.update', (updates) => {
+    for (const u of updates) {
+      if (!u.id) continue
+      const prev = contactsMap.get(u.id) || { id: u.id }
+      contactsMap.set(u.id, { ...prev, ...u })
+    }
+  })
+  sock.ev.on('chats.set', ({ chats, isLatest }) => {
+    for (const c of chats) {
+      chatsMap.set(c.id, {
+        jid: c.id,
+        name: (c as any).name,
+        unreadCount: (c as any).unreadCount,
+        lastMsgTs: (c as any).lastMsgRecv
+      })
+    }
+    logger.info({ count: chats.length, isLatest }, 'chats.set')
+  })
+  sock.ev.on('chats.upsert', (chs) => {
+    for (const c of chs) {
+      chatsMap.set(c.id, {
+        jid: c.id,
+        name: (c as any).name,
+        unreadCount: (c as any).unreadCount,
+        lastMsgTs: (c as any).lastMsgRecv
+      })
+    }
+  })
+  sock.ev.on('chats.update', (chs) => {
+    for (const c of chs) {
+      const prev = chatsMap.get(c.id!) || { jid: c.id! }
+      chatsMap.set(c.id!, { ...prev, name: (c as any).name ?? prev.name })
+    }
+  })
+
+  /* ---------- messages ---------- */
+  sock.ev.on('messages.set', ({ chats, messages, isLatest }) => {
+    for (const m of messages) pushMessage(m)
+    logger.info({ chats: chats.length, messages: messages.length, isLatest }, 'messages.set')
+  })
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const m of messages) pushMessage(m)
+  })
+  sock.ev.on('messages.update', (updates) => {
+    for (const u of updates) {
+      const jid = u.key?.remoteJid || ''
+      const arr = msgMap.get(jid)
+      if (!arr) continue
+      const idx = arr.findIndex(m => m.key?.id === u.key?.id)
+      if (idx >= 0) arr[idx] = { ...arr[idx], ...u } as any
+    }
+  })
+
+  /* ---------- connection lifecycle ---------- */
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u
+
+    if (qr) {
+      currentQR = qr
+      qrStatus = 'pending'
+      logger.info('QR ready')
+    }
+
+    if (connection === 'open') {
+      logger.info('WhatsApp connection OPEN')
+      qrStatus = 'open'
+      currentQR = null
+      return
+    }
+
+    if (connection === 'close') {
+      const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
+      logger.warn({ code, reason: DisconnectReason[code as any] }, 'connection closed')
+
+      // 515 = restart required -> reconnect WITHOUT wiping auth
+      if (code === 515 || code === DisconnectReason.restartRequired) {
+        logger.warn('Restart required — reconnecting (no auth reset)')
+        setTimeout(connectWA, 500)
+        return
+      }
+
+      // 401/loggedOut -> wipe & restart
+      if (code === 401 || code === DisconnectReason.loggedOut) {
+        logger.error('Logged out — resetting auth & restarting')
+        await resetAuthAndRestart()
+        return
+      }
+
+      // other -> try reconnect
+      setTimeout(connectWA, 1000)
+    }
+  })
 }
 
 async function resetAuthAndRestart() {
-  try { await sock?.logout().catch(() => {}) } catch {}
-  try { await fsp.rm(DATA_DIR, { recursive: true, force: true }) } catch {}
-  sock = undefined
-  lastQR = null
-  lastStatus = 'closed'
-  sseBroadcast({ type: 'status', status: 'closed' })
-  await startSock()
+  try {
+    if (sock) {
+      await sock.logout() // will throw Intentional Logout in logs (normal)
+    }
+  } catch {}
+  await resetAuthFolder()
+  currentQR = null
+  qrStatus = 'pending'
+  await connectWA()
 }
 
-// boot
-startSock().catch(async (e) => {
-  logger.error({ e }, 'boot failed, resetting auth and retry')
-  await resetAuthAndRestart()
-})
-
-// ============ ROUTES: HTML helper ============
-
-app.get('/', (_req, res) => {
-  res.send(`<html><head><meta charset="utf-8"><title>Zuria.AI WA</title></head>
-  <body style="font-family:system-ui;padding:24px">
-    <h1>Zuria.AI — WhatsApp Gateway</h1>
-    <p><a href="/qr">Scanner /qr</a> • <a href="/events" target="_blank">Events</a> • <a href="/health">health</a></p>
-    <pre>Status: ${lastStatus}</pre>
-  </body></html>`)
+/* ----------------------------- routes --------------------------- */
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, status: qrStatus, connected: Boolean(sock?.user), user: sock?.user || null })
 })
 
 app.get('/qr', (_req, res) => {
+  if (qrStatus === 'open') {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    return res.end(`
+      <html><head><meta charset="utf-8"><title>WA QR</title>
+      <style>body{font-family:system-ui,Arial;padding:24px}img{border:8px solid #eee;border-radius:16px}</style>
+      </head><body>
+      <h1>Déjà lié ✅</h1>
+      <p>Status: open</p>
+      </body></html>
+    `)
+  }
+  const q = currentQR ? encodeURIComponent(currentQR) : ''
   res.setHeader('content-type', 'text/html; charset=utf-8')
-  res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>QR</title>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
-<style>body{font-family:system-ui;padding:24px}#q{width:360px;height:360px}</style>
-</head><body>
-  <h1>Scanne avec WhatsApp</h1>
-  <canvas id="q"></canvas>
-  <p id="s">Status: ${lastStatus}</p>
-<script>
-  const c = document.getElementById('q')
-  const s = document.getElementById('s')
-  const draw = (txt) => {
-    if (!txt) return
-    QRCode.toCanvas(c, txt, { width: 360 }, (err)=>{ if(err) console.error(err) })
-  }
-  if (${JSON.stringify(lastQR)}){
-    draw(${JSON.stringify(lastQR)})
-    s.textContent = 'Status: pending'
-  } else {
-    s.textContent = 'QR pas encore prêt — recharge dans 3 s'
-    setTimeout(()=>location.reload(), 3000)
-  }
-  const evt = new EventSource('/events')
-  evt.onmessage = (e) => {
-    try{
-      const payload = JSON.parse(e.data)
-      if(payload.type==='qr'){ draw(payload.qr); s.textContent='Status: pending' }
-      if(payload.type==='status'){ s.textContent='Status: '+payload.status }
-      if(payload.type==='ready'){ s.textContent='Déjà lié ✅'; }
-    }catch(_){}
-  }
-</script>
-</body></html>`)
+  res.end(`
+    <html><head><meta charset="utf-8"><title>WA QR</title>
+    <style>body{font-family:system-ui,Arial;padding:24px}img{border:8px solid #eee;border-radius:16px}</style>
+    </head><body>
+      <h1>Scanne avec WhatsApp</h1>
+      ${currentQR ? `<img width="320" height="320" src="https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${q}" />`
+                   : `<p>QR non prêt…</p>`}
+      <p>Status: ${qrStatus}</p>
+    </body></html>
+  `)
 })
 
-// SSE stream
-app.get('/events', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache, no-transform')
-  res.setHeader('Connection', 'keep-alive')
-  res.flushHeaders()
-  sseClients.add(res)
-  // send initial status
-  res.write(`data: ${JSON.stringify({ type: 'status', status: lastStatus })}\n\n`)
-  if (lastQR) res.write(`data: ${JSON.stringify({ type: 'qr', qr: lastQR })}\n\n`)
-  req.on('close', () => sseClients.delete(res))
+app.get('/qr/json', (_req, res) => {
+  res.json({ status: qrStatus, qr: currentQR })
 })
-
-// ============ ROUTES: HEALTH / SESSION ============
-app.get('/health', (_req, res) => res.json({ ok: true }))
-app.get('/healt', (_req, res) => res.json({ ok: true })) // (orthographe tolérée)
 
 app.post('/session/reset', requireAuth, async (_req, res) => {
   await resetAuthAndRestart()
-  res.json({ ok: true, status: 'reset', next: '/qr' })
+  res.json({ ok: true })
 })
 
-// ============ ROUTES: INFO ============
-app.get('/me', (_req, res) => {
-  const me = sock?.user || null
-  res.json({ me })
+app.post('/session/reconnect', requireAuth, async (_req, res) => {
+  connectWA()
+  res.json({ ok: true })
 })
 
-app.get('/profile-pic', requireAuth, async (req, res) => {
-  try {
-    const jid = jidNormalize(String(req.query.jid || ''))
-    if (!jid) return res.status(400).json({ error: 'jid required' })
-    const url = await sock!.profilePictureUrl(jid as any).catch(() => null)
-    res.json({ jid, url })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ============ ROUTES: LISTING ============
-app.get('/contacts', requireAuth, async (_req, res) => {
-  const arr = Object.values(store.contacts)
-    .map((c: any) => ({
-      jid: c.id,
-      name: c.name || c.verifiedName || '',
-      notify: c.notify || '',
-      verifiedName: c.verifiedName || '',
-      isBusiness: !!c.biz
-    }))
-  res.json({ count: arr.length, contacts: arr })
-})
-
-app.get('/chats', requireAuth, async (_req, res) => {
-  const chats = store.chats.all()
-  const mapped = chats.map((c: any) => ({
-    jid: c.id,
-    name: c.name || '',
-    unreadCount: c.unreadCount || 0,
-    lastMsgTs: c.conversationTimestamp || undefined
-  }))
-  res.json({ count: mapped.length, chats: mapped })
-})
-
-app.get('/messages', requireAuth, async (req, res) => {
-  try {
-    const jid = jidNormalize(String(req.query.jid || ''))
-    const limit = Number(req.query.limit || 25)
-    if (!jid) return res.status(400).json({ error: 'jid required' })
-		const msgs = await store.loadMessages(jid, limit, undefined as any)
-    const mapped = msgs.map((m: any) => {
-      const t = messageToText(m)
-      return {
-        key: m.key,
-        pushName: m.pushName,
-        timestamp: Number(m.messageTimestamp || m.message?.messageContextInfo?.deviceListMetadata?.timestamp || Date.now()),
-        type: t.type,
-        text: t.text,
-        reactions: m.message?.reactionMessage ? [m.message.reactionMessage.text] : [],
-        raw: undefined
-      }
-    })
-    res.json({ jid, count: mapped.length, messages: mapped })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ============ ROUTES: SEND ============
+/* --------- sending: text / image / audio / reaction  ---------- */
 app.post('/send-text', requireAuth, async (req, res) => {
   try {
-    if (!sock) return res.status(503).json({ error: 'Socket not ready' })
-    const { to, text } = req.body || {}
-    if (!to || !text) return res.status(400).json({ error: 'to and text required' })
-    const jid = jidNormalize(to)
-    await sock.sendMessage(jid, { text: String(text) })
-    res.json({ ok: true, to: jid })
+    const jid = toJid(req.body.to)
+    const text = (req.body.text || '').toString()
+    if (!sock) throw new Error('socket not ready')
+    await sock.sendMessage(jid, { text })
+    res.json({ ok: true })
   } catch (e: any) {
-    res.status(500).json({ error: e.message })
+    res.status(400).json({ ok: false, error: e.message })
   }
 })
 
 app.post('/send-image', requireAuth, async (req, res) => {
   try {
-    if (!sock) return res.status(503).json({ error: 'Socket not ready' })
-    const { to, url, dataUrl, caption } = req.body || {}
-    if (!to || (!url && !dataUrl)) return res.status(400).json({ error: 'to and (url or dataUrl) required' })
-    const jid = jidNormalize(to)
-    if (url) {
-      await sock.sendMessage(jid, { image: { url }, caption })
-    } else {
-      const base64 = String(dataUrl).split(',')[1] || dataUrl
-      const bin = Buffer.from(base64, 'base64')
-      await sock.sendMessage(jid, { image: bin, caption })
-    }
-    res.json({ ok: true, to: jid })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ---------- Send audio (voice note or regular) ----------
-app.post('/send-audio', requireAuth, async (req, res) => {
-  try {
-    if (!sock) return res.status(503).json({ error: 'Socket not ready' })
-    const { to, url, dataUrl, ptt } = req.body || {}
-    if (!to || (!url && !dataUrl)) return res.status(400).json({ error: 'to and (url or dataUrl) required' })
-    const jid = jidNormalize(to)
-    if (url) {
-      await sock.sendMessage(jid, { audio: { url }, ptt: !!ptt })
-    } else {
-      const base64 = String(dataUrl).split(',')[1] || dataUrl
-      const bin = Buffer.from(base64, 'base64')
-      await sock.sendMessage(jid, { audio: bin, ptt: !!ptt })
-    }
-    res.json({ ok: true, to: jid, ptt: !!ptt })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ---------- Send document (PDF, DOCX, etc.) ----------
-app.post('/send-document', requireAuth, async (req, res) => {
-  try {
-    if (!sock) return res.status(503).json({ error: 'Socket not ready' })
-    const { to, url, dataUrl, mimetype, fileName } = req.body || {}
-    if (!to || (!url && !dataUrl)) return res.status(400).json({ error: 'to and (url or dataUrl) required' })
-    const jid = jidNormalize(to)
-    const mt = mimetype || 'application/pdf'
-    const name = fileName || 'document.pdf'
-    if (url) {
-      await sock.sendMessage(jid, { document: { url }, mimetype: mt, fileName: name })
-    } else {
-      const base64 = String(dataUrl).split(',')[1] || dataUrl
-      const bin = Buffer.from(base64, 'base64')
-      await sock.sendMessage(jid, { document: bin, mimetype: mt, fileName: name })
-    }
-    res.json({ ok: true, to: jid, mimetype: mt, fileName: name })
-  } catch (e: any) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ---------- React to a message ----------
-app.post('/react', requireAuth, async (req, res) => {
-  try {
-    if (!sock) return res.status(503).json({ error: 'Socket not ready' })
-    const { jid, id, emoji, emojiCode } = req.body || {}
-    if (!jid || !id) return res.status(400).json({ error: 'jid and id required' })
-    const j = jidNormalize(jid)
-    // find original message
-		const msgs = await store.loadMessages(j, 50, undefined as any)
-    const original = msgs.find((m: any) => m.key?.id === id)
-    if (!original) return res.status(404).json({ error: 'message not found in store' })
-    const emj = normalizeEmoji(emoji, emojiCode)
-    await sock.sendMessage(j, { react: { text: emj, key: original.key as WAMessageKey } })
+    const jid = toJid(req.body.to)
+    const url = (req.body.url || '').toString()
+    const caption = (req.body.caption || '').toString()
+    if (!sock) throw new Error('socket not ready')
+    await sock.sendMessage(jid, { image: { url }, caption })
     res.json({ ok: true })
   } catch (e: any) {
-    res.status(500).json({ error: e.message })
+    res.status(400).json({ ok: false, error: e.message })
   }
 })
 
-// ============ START SERVER ============
-app.listen(PORT, () => {
-  logger.info(`HTTP server listening on :${PORT}`)
+// audio normal (ptt=false) — pour note vocale utilisez /send-ptt
+app.post('/send-audio', requireAuth, async (req, res) => {
+  try {
+    const jid = toJid(req.body.to)
+    const url = (req.body.url || '').toString()
+    if (!sock) throw new Error('socket not ready')
+    await sock.sendMessage(jid, { audio: { url }, mimetype: 'audio/mpeg' })
+    res.json({ ok: true })
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message })
+  }
 })
+
+// voice note (push-to-talk)
+app.post('/send-ptt', requireAuth, async (req, res) => {
+  try {
+    const jid = toJid(req.body.to)
+    const url = (req.body.url || '').toString()
+    if (!sock) throw new Error('socket not ready')
+    await sock.sendMessage(jid, { audio: { url }, ptt: true, mimetype: 'audio/ogg' })
+    res.json({ ok: true })
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message })
+  }
+})
+
+app.post('/react', requireAuth, async (req, res) => {
+  try {
+    if (!sock) throw new Error('socket not ready')
+    const jid = toJid(req.body.jid)
+    const id = (req.body.id || '').toString()
+    const emoji = (req.body.emoji || '').toString()
+    const participant = (req.body.participant || '').toString() || undefined
+    const key: WAMessageKey = { id, remoteJid: jid, fromMe: false, participant }
+    await sock.sendMessage(jid, { react: { text: emoji, key } })
+    res.json({ ok: true })
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message })
+  }
+})
+
+/* ---------------------- data listing APIs ---------------------- */
+app.get('/contacts', requireAuth, (_req, res) => {
+  const contacts = Array.from(contactsMap.values())
+  res.json({ count: contacts.length, contacts })
+})
+
+app.get('/chats', requireAuth, (_req, res) => {
+  const chats = Array.from(chatsMap.values())
+  res.json({ count: chats.length, chats })
+})
+
+app.get('/messages', requireAuth, async (req, res) => {
+  try {
+    const jid = toJid((req.query.jid || '').toString())
+    const limit = Math.max(1, Math.min( Number(req.query.limit || 50), 200))
+    const arr = (msgMap.get(jid) || []).slice(-limit)
+    res.json({ jid, count: arr.length, messages: arr })
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message })
+  }
+})
+
+/* ---------------------------- start ---------------------------- */
+const PORT = Number(process.env.PORT || 10000)
+app.listen(PORT, () => logger.info(`HTTP server listening on :${PORT}`))
+connectWA().catch(err => logger.error(err, 'connectWA failed'))
