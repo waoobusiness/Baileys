@@ -10,10 +10,10 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
-  Browsers,
   fetchLatestBaileysVersion,
   WAMessage,
-  proto
+  proto,
+  WAMessageKey
 } from '@whiskeysockets/baileys';
 import { EventEmitter } from 'events';
 
@@ -158,7 +158,13 @@ async function maybeDownloadMedia(wamessage: WAMessage) {
   if (!mediaEntry) return null;
 
   try {
-    const buffer = await downloadMediaMessage(wamessage, 'buffer', {}, { logger });
+    // Provide reuploadRequest + logger to satisfy TS typings
+    const buffer = await downloadMediaMessage(
+      wamessage,
+      'buffer',
+      {},
+      { reuploadRequest: sock!.updateMediaMessage, logger }
+    );
     const mt: string = mediaEntry.mimetype || 'application/octet-stream';
     const ext = mime.extension(mt) || 'bin';
     const fname = `${wamessage.key?.id}.${ext}`;
@@ -190,7 +196,9 @@ async function startSock() {
     logger,
     auth: state,
     version,
-    browser: Browsers.macOS('Desktop'),
+    // ---- BRANDING DEVICE NAME ----
+    browser: ['Zuria.AI', 'Chrome', '1.0.0'],
+    // ------------------------------
     syncFullHistory: true,
     printQRInTerminal: true,
     getMessage: async (key) => {
@@ -398,14 +406,22 @@ async function startSock() {
     }
   });
 
-  // Edits / deletes (log only)
+  // Edits (log only)
   sock.ev.on('messages.update', (arr: any[]) => logger.debug({ count: arr.length }, 'messages.update'));
-  sock.ev.on('messages.delete', (arr: any[]) => logger.debug({ count: arr.length }, 'messages.delete'));
+
+  // Deletes (union type: { keys } | { jid, all: true })
+  sock.ev.on('messages.delete', (arg: { keys: WAMessageKey[] } | { jid: string; all: true }) => {
+    if ('keys' in arg) {
+      logger.debug({ deleted: arg.keys.length }, 'messages.delete (keys)');
+    } else {
+      logger.debug({ jid: arg.jid, all: true }, 'messages.delete (all in chat)');
+    }
+  });
 }
 
 // ---------- Auth middleware (Bearer) ----------
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!AUTH_TOKEN) return next(); // pas d’auth en dev si vide
+  if (!AUTH_TOKEN) return next(); // pas d’auth si vide (dev)
   const hdr = req.get('authorization') || '';
   if (!hdr.startsWith('Bearer ')) return res.status(401).json({ error: 'missing bearer token' });
   const token = hdr.slice('Bearer '.length);
