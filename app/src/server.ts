@@ -17,30 +17,20 @@ import {
 import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
-import carsRouter from './cars-router'
-// ...
-app.use('/cars', requireAuth, carsRouter) // protège les routes /cars/*
-
 
 /* ------------------------- logger & app ------------------------- */
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
-import carsRouter from './cars-router'
-
-// … juste après app.use(express.json(…))
-app.use('/cars', requireAuth, carsRouter)
-// si tu veux laisser /cars/health public :
-// app.use('/cars', carsRouter)
-// puis protège uniquement les POST avec requireAuth dans cars-router
-
 
 /* --------------------------- security -------------------------- */
-const AUTH_TOKEN =  
-	process.env.RESOLVER_BEARER ||
+// Accept either RESOLVER_BEARER (for Lovable) or AUTH_TOKEN (manual/testing)
+const AUTH_TOKEN =
+  process.env.RESOLVER_BEARER ||
   process.env.AUTH_TOKEN ||
-  'MY_PRIVATE_FURIA_API_KEY_2025''MY_PRIVATE_FURIA_API_KEY_2025'
+  'MY_PRIVATE_FURIA_API_KEY_2025'
+
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const hdr = (req.headers['authorization'] || '').toString()
   const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
@@ -103,7 +93,6 @@ async function connectWA() {
     markOnlineOnConnect: false,
     syncFullHistory: false,
     shouldIgnoreJid: () => false,
-    // Baileys attend le "message content" -> proto.IMessage
     getMessage: async (key: WAMessageKey): Promise<proto.IMessage | undefined> => {
       const jid = key.remoteJid || ''
       const arr = msgMap.get(jid) || []
@@ -112,12 +101,10 @@ async function connectWA() {
     },
   })
 
-  const ev: any = sock.ev // relâche le typage pour suivre les changements Baileys
+  const ev: any = sock.ev
 
-  /* ---------- persist creds ---------- */
   ev.on('creds.update', saveCreds)
 
-  /* ---------- contacts/chats bootstrap ---------- */
   ev.on('contacts.set', ({ contacts }: any) => {
     for (const c of contacts || []) {
       if (!c?.id) continue
@@ -169,7 +156,6 @@ async function connectWA() {
     }
   })
 
-  /* ---------- messages ---------- */
   ev.on('messages.set', ({ chats, messages, isLatest }: any) => {
     for (const m of messages || []) pushMessage(m)
     logger.info({ chats: (chats || []).length, messages: (messages || []).length, isLatest }, 'messages.set')
@@ -189,7 +175,6 @@ async function connectWA() {
     }
   })
 
-  /* ---------- connection lifecycle ---------- */
   ev.on('connection.update', async (u: any) => {
     const { connection, lastDisconnect, qr } = u
 
@@ -210,21 +195,14 @@ async function connectWA() {
       const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
       logger.warn({ code, reason: (DisconnectReason as any)[code || ''] }, 'connection closed')
 
-      // 515 -> restart required (pas d’effacement d’auth)
       if (code === 515 || code === DisconnectReason.restartRequired) {
-        logger.warn('Restart required — reconnecting (no auth reset)')
         setTimeout(connectWA, 500)
         return
       }
-
-      // 401/loggedOut -> wipe & restart
       if (code === 401 || code === DisconnectReason.loggedOut) {
-        logger.error('Logged out — resetting auth & restarting')
         await resetAuthAndRestart()
         return
       }
-
-      // autres cas -> reconnexion simple
       setTimeout(connectWA, 1000)
     }
   })
@@ -282,6 +260,7 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
   connectWA()
   res.json({ ok: true })
 })
+
 /* ----------------------- CARS RESOLVER ------------------------ */
 const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
 
@@ -303,8 +282,6 @@ app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   const link = String(req.body.link || '')
   if (!link) return res.status(400).json({ ok:false, error:'link required' })
 
-  // TODO: ici tu mettras ta logique de résolution (détection listing/garage + fetch)
-  // Pour l’instant on renvoie un stub propre pour que Lovable ne soit plus en 404.
   const kind = /autoscout24/i.test(link)
     ? (/\/d\//.test(link) ? 'listing' : 'garage')
     : 'unknown'
@@ -312,13 +289,12 @@ app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   return res.json({ ok:true, kind, link })
 })
 
-// (facultatif) Preview: même signature que connect, utile si Lovable appelle /preview
+// (facultatif) Preview
 app.post('/cars/preview', requireResolverAuth, async (req, res) => {
   const link = String(req.body.link || '')
   if (!link) return res.status(400).json({ ok:false, error:'link required' })
   return res.json({ ok:true, preview:true, link })
 })
-
 
 /* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
