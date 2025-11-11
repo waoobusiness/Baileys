@@ -208,7 +208,6 @@ async function startSock(sessionId: string) {
 async function wipeSession(sessionId: string) {
   const s = getOrCreateSession(sessionId);
   try { await s.sock?.logout(); } catch {}
-  try { s.sock?.end?.(); } catch {}
   s.sock = undefined;
   s.status = 'pending';
   s.qrText = null; s.qrDataURL = null; s.jid = null; s.phone = null;
