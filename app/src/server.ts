@@ -4,7 +4,6 @@ import cors from 'cors';
 import pino from 'pino';
 import fs from 'fs/promises';
 import path from 'path';
-import QRCode from 'qrcode';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
@@ -28,6 +27,20 @@ let lastQRDataURL: string | null = null;
 let lastQRText: string | null = null;
 let lastStatus: 'pending' | 'qr' | 'connected' | 'closed' = 'pending';
 let restarting = false;
+
+/** ====== QR LIB (lazy import pour éviter crash si non installée) ====== */
+type QRLib = typeof import('qrcode');
+let QRCodeLib: QRLib | null = null;
+async function ensureQRCodeLib(): Promise<QRLib | null> {
+  if (QRCodeLib) return QRCodeLib;
+  try {
+    QRCodeLib = await import('qrcode');
+    return QRCodeLib;
+  } catch {
+    logger.warn('Package "qrcode" introuvable : fallback texte uniquement (qrText).');
+    return null;
+  }
+}
 
 /** ====== UTILS ====== */
 function requireBearer(req: express.Request, res: express.Response): boolean {
@@ -66,13 +79,20 @@ async function startSock() {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
+      lastQRText = qr;
+      lastStatus = 'qr';
       try {
-        lastQRText = qr;
-        lastQRDataURL = await QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' });
-        lastStatus = 'qr';
-        logger.info('QR updated (dataURL ready)');
+        const lib = await ensureQRCodeLib();
+        if (lib) {
+          lastQRDataURL = await lib.toDataURL(qr, { errorCorrectionLevel: 'M' });
+          logger.info('QR updated: dataURL ready');
+        } else {
+          lastQRDataURL = null;
+          logger.info('QR updated: text only (no qrcode pkg)');
+        }
       } catch (e) {
-        logger.error({ e }, 'QR encode failed');
+        lastQRDataURL = null;
+        logger.error({ err: e instanceof Error ? e.message : String(e) }, 'QR encode failed');
       }
     }
 
@@ -92,14 +112,13 @@ async function startSock() {
         try {
           await startSock();
         } catch (e) {
-          logger.error({ e }, 'auto-reconnect failed');
+          logger.error({ err: e instanceof Error ? e.message : String(e) }, 'auto-reconnect failed');
         }
       }
     }
   });
 
   sock.ev.on('messages.upsert', (m) => {
-    // raccourci log
     const cnt = m.messages?.length || 0;
     logger.debug({ type: m.type, cnt }, 'messages.upsert');
   });
@@ -112,7 +131,7 @@ async function hardResetAndRestart() {
   restarting = true;
   try {
     try { await sock?.logout?.(); } catch {}
-    try { sock?.ws?.close?.(); } catch {}
+    try { (sock as any)?.ws?.close?.(); } catch {}
     sock = null;
 
     await wipeAuthDir();
@@ -147,54 +166,66 @@ app.post('/session/reset', async (req, res) => {
     await hardResetAndRestart();
     res.json({ ok: true, status: 'pending' });
   } catch (e) {
-    logger.error({ e }, 'reset failed');
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
 
-// Optional: start (soft init) if you want a manual kick
+// Optional: start (soft init)
 app.post('/session/start', async (_req, res) => {
   try {
     if (!sock) await startSock();
     res.json({ ok: true, status: lastStatus });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
 
 // QR endpoint (JSON). If connected + force=1 and auth ok -> hard reset first.
 app.get('/qr', async (req, res) => {
-  const force = String(req.query.force || '') === '1';
+  try {
+    const force = String(req.query.force || '') === '1';
 
-  if (sock?.user && force) {
-    if (!requireBearer(req, res)) return;
-    try {
+    if (sock?.user && force) {
+      if (!requireBearer(req, res)) return;
       await hardResetAndRestart();
-    } catch (e) {
-      return res.status(500).json({ ok: false, error: 'reset_failed', details: String(e) });
     }
-  }
 
-  if (sock?.user) {
-    return res.json({ ok: true, status: 'connected', jid: sock.user.id });
-  }
+    if (sock?.user) {
+      return res.json({ ok: true, status: 'connected', jid: sock.user.id });
+    }
 
-  if (lastStatus === 'qr' && lastQRDataURL) {
-    return res.json({ ok: true, status: 'qr', qr: lastQRDataURL });
-  }
+    if (lastStatus === 'qr') {
+      const dataURL = lastQRDataURL ?? null;
+      const text = lastQRText ?? null;
+      // Back-compat (qr/text) + nouveau schéma (qrDataURL/qrText)
+      return res.json({
+        ok: true,
+        status: 'qr',
+        qr: dataURL,
+        text,
+        qrDataURL: dataURL,
+        qrText: text
+      });
+    }
 
-  return res.json({ ok: true, status: lastStatus }); // 'pending' | 'closed'
+    return res.json({ ok: true, status: lastStatus }); // 'pending' | 'closed'
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
 });
 
-/** ====== SEND HELPERS (OPTIONNEL, si tu les utilises déjà) ====== */
+/** ====== SEND HELPERS ====== */
 app.post('/send-text', async (req, res) => {
   try {
     const { to, text } = req.body as { to: string; text: string };
     if (!sock) return res.status(503).json({ ok: false, error: 'not_ready' });
-    await sock.sendMessage(to.endsWith('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`, { text });
+    await sock.sendMessage(
+      to.endsWith('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`,
+      { text }
+    );
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
 
