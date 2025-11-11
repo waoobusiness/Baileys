@@ -279,7 +279,8 @@ app.get('/cars/health', (_req, res) => {
 
 // Connect: reçoit un lien (listing AutoScout24 ou page garage)
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
-  const link = String(req.body.link || '')
+  // ✅ tolérant : accepte link, url ou href
+  const link = String(req.body.link || req.body.url || req.body.href || '').trim()
   if (!link) return res.status(400).json({ ok:false, error:'link required' })
 
   const kind = /autoscout24/i.test(link)
@@ -288,6 +289,7 @@ app.post('/cars/connect', requireResolverAuth, async (req, res) => {
 
   return res.json({ ok:true, kind, link })
 })
+
 
 // (facultatif) Preview
 app.post('/cars/preview', requireResolverAuth, async (req, res) => {
