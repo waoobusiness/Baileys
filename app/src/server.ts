@@ -1,7 +1,6 @@
 // src/server.ts
 import 'dotenv/config'
 import express, { Request, Response, NextFunction } from 'express'
-import carsConnectRouter, { carsConnectParsers } from "./cars-connect";
 import cors from 'cors'
 import pino from 'pino'
 import { Boom } from '@hapi/boom'
@@ -20,10 +19,12 @@ import path from 'path'
 /* ------------------------- logger & app ------------------------- */
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const app = express()
-app.use(carsConnectParsers);
-app.use("/cars", carsConnectRouter);
+
+/** Parsers (ordre important) */
 app.use(cors())
-app.use(express.json({ limit: '10mb' }))
+app.use(express.text({ type: ['text/plain', 'text/*'], limit: '2mb' }))          // bodies textuels
+app.use(express.urlencoded({ extended: true, limit: '2mb' }))                     // x-www-form-urlencoded
+app.use(express.json({ strict: false, limit: '10mb' }))                           // JSON permissif
 
 /* --------------------------- security -------------------------- */
 // Accept either RESOLVER_BEARER (for Lovable) or AUTH_TOKEN (manual/testing)
@@ -34,8 +35,10 @@ const AUTH_TOKEN =
 
 // Token spécifique pour /cars/*
 const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
+
 // Fallback proxy pour contourner les 403 (ex: Supabase Edge function "html-proxy")
-const CARS_PROXY_URL = process.env.CARS_PROXY_URL || '' // ex: https://<project>.functions.supabase.co/html-proxy
+// ex: https://<project>.functions.supabase.co/html-proxy
+const CARS_PROXY_URL = process.env.CARS_PROXY_URL || ''
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const hdr = (req.headers['authorization'] || '').toString()
@@ -91,6 +94,89 @@ function pushMessage(m: any) {
 async function resetAuthFolder() {
   try { await fsp.rm(AUTH_DIR, { recursive: true, force: true }) } catch {}
   await fsp.mkdir(AUTH_DIR, { recursive: true })
+}
+
+/** Masque les headers sensibles pour debug */
+function maskHeaders(h: Record<string, any>) {
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(h || {})) {
+    const lk = k.toLowerCase()
+    out[k] = (lk === 'authorization' || lk.includes('token')) ? '***' : v
+  }
+  return out
+}
+
+function isProbablyUrl(v: unknown): v is string {
+  if (typeof v !== 'string') return false
+  const s = v.trim()
+  if (!s) return false
+  try {
+    new URL(s.startsWith('http') ? s : `https://${s}`)
+    return true
+  } catch { return false }
+}
+
+/** Recherche récursive d'un champ url/link/uri dans un objet */
+function deepFindLink(obj: unknown, depth = 0): string | null {
+  if (depth > 6 || obj == null) return null
+  if (typeof obj === 'string') return isProbablyUrl(obj) ? obj.trim() : null
+  if (typeof obj !== 'object') return null
+
+  const direct = (obj as any)['link'] || (obj as any)['url'] || (obj as any)['uri']
+  if (isProbablyUrl(direct)) return String(direct).trim()
+
+  const candidates = ['data','payload','record','input','inputs','args','event','body','message','params']
+  for (const k of candidates) {
+    const v = (obj as any)[k]
+    const found = deepFindLink(v, depth + 1)
+    if (found) return found
+  }
+  for (const v of Object.values(obj as Record<string, unknown>)) {
+    const found = deepFindLink(v, depth + 1)
+    if (found) return found
+  }
+  return null
+}
+
+/** Extraction robuste du lien quelle que soit la forme d'entrée */
+function extractLink(req: Request): { link: string | null; debug: any } {
+  // header
+  const hLink = req.header('x-link')
+  if (isProbablyUrl(hLink)) return { link: hLink!.trim(), debug: { via: 'header' } }
+
+  // query
+  const q: any = req.query || {}
+  const qLink = q.link || q.url || q.uri
+  if (isProbablyUrl(qLink)) return { link: String(qLink).trim(), debug: { via: 'query' } }
+
+  // body
+  const ct = String(req.headers['content-type'] || '').toLowerCase()
+  let body: any = req.body
+
+  // text/plain → soit URL directe, soit JSON/URL-encoded déguisé
+  if ((!ct || ct.includes('text/plain')) && typeof body === 'string') {
+    const text = body.trim()
+    if (isProbablyUrl(text)) return { link: text, debug: { via: 'text_body' } }
+    try { body = JSON.parse(text) } catch {
+      try {
+        const sp = new URLSearchParams(text)
+        const f = sp.get('link') || sp.get('url') || sp.get('uri')
+        if (isProbablyUrl(f)) return { link: f!.trim(), debug: { via: 'formish_text' } }
+      } catch {}
+    }
+  }
+
+  if (ct.includes('application/x-www-form-urlencoded') && body && typeof body === 'object') {
+    const f = body.link || body.url || body.uri
+    if (isProbablyUrl(f)) return { link: String(f).trim(), debug: { via: 'urlencoded' } }
+  }
+
+  if (body != null) {
+    const found = deepFindLink(body)
+    if (found) return { link: found, debug: { via: 'json_deep' } }
+  }
+
+  return { link: null, debug: { via: 'none', ct, hasBody: body != null, bodyType: typeof body } }
 }
 
 /* ----------------------- WA connection flow --------------------- */
@@ -309,12 +395,30 @@ type InventoryPreview = {
 
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   try {
-    const link = String(req.body?.link || '')
-    if (!link) return res.status(400).json({ ok:false, error:'link required' })
+    const { link, debug } = extractLink(req)
+    if (!link) {
+      return res.status(400).json({
+        ok: false,
+        error: 'link required',
+        debug: {
+          ...debug,
+          headers: maskHeaders(req.headers as any),
+          query: req.query,
+          bodyPreview:
+            typeof req.body === 'string' ? req.body.slice(0, 300)
+            : req.body && typeof req.body === 'object' ? Object.keys(req.body).slice(0, 20)
+            : typeof req.body,
+        },
+      })
+    }
 
     const { ok, status, html, viaProxy } = await smartGetHtml(link)
     if (!ok || !html) {
-      return res.status(502).json({ ok:false, error:'upstream_fetch_failed', details: status === 403 ? 'fetch_failed_403' : `status_${status}` })
+      return res.status(502).json({
+        ok:false,
+        error:'upstream_fetch_failed',
+        details: status === 403 ? 'fetch_failed_403' : `status_${status}`
+      })
     }
 
     // 1) NEXT_DATA (Next.js)
@@ -364,12 +468,12 @@ async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number
   }
 
   try {
-    const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
+    const r = await fetch(url, { headers, redirect: 'follow' as any })
     if (r.status === 200) {
       const html = await r.text()
       return { ok: true, status: 200, html, viaProxy: false }
     }
-    // 301/302 suivis automatiquement; si 403 → fallback proxy
+    // 301/302 suivis automatiquement; si 403/503 → fallback proxy
     if (r.status === 403 || r.status === 503) {
       if (!CARS_PROXY_URL) return { ok:false, status: r.status }
       // proxy simple: GET ?url=encoded
@@ -417,7 +521,7 @@ function extractAllJsonLd(html: string): any[] {
       if (Array.isArray(parsed)) out.push(...parsed)
       else out.push(parsed)
     } catch {
-      // rien
+      // ignore
     }
   }
   return out
@@ -429,7 +533,6 @@ function isItemList(ld: any): boolean {
 }
 
 function deepPick(obj: any, keys: string[]): any {
-  // Cherche la première clé dispo (profondeur limitée)
   if (!obj || typeof obj !== 'object') return undefined
   for (const k of keys) {
     if (obj && typeof obj === 'object' && k in obj) return (obj as any)[k]
@@ -444,7 +547,7 @@ function deepPick(obj: any, keys: string[]): any {
 }
 
 function getNum(val: any): number | undefined {
-  if (val === null || val === undefined) return undefined
+  if (val == null) return undefined
   const s = String(val).replace(/\s/g, '')
   const m = s.match(/-?\d+(?:[.,]\d+)?/)
   if (!m) return undefined
@@ -492,7 +595,6 @@ function mapLdToCar(ld: any): CarNormalized | null {
   const url = ld.url
 
   if (!brand && !model && !price && !year && !images?.length) {
-    // trop faible → considérer non pertinent
     return null
   }
 
@@ -528,9 +630,10 @@ function fromItemList(ld: any): InventoryPreview[] {
     const title = (item.name || el.name || '').toString() || undefined
     const price = getNum(item?.offers?.price ?? el?.offers?.price)
 
-    // Ne pas mélanger ?? et || sans parenthèses (TS5076)
+    // Évite TS5076: pas de mélange ?? et || sans parenthèses
     const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
-    const currency = String(currencyRaw).toUpperCase() || undefined
+    const cur = String(currencyRaw).trim()
+    const currency = cur ? cur.toUpperCase() : undefined
 
     items.push({ url, title, price, currency })
   }
