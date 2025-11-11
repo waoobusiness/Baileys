@@ -22,15 +22,23 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
+// Handler d’erreur JSON mal formé (sinon Express renvoie HTML "Bad Request")
+app.use(function jsonParseErrorHandler(err: any, _req: Request, res: Response, next: NextFunction) {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ ok: false, error: 'invalid_json_body' })
+  }
+  return next(err)
+})
+
 /* --------------------------- security -------------------------- */
-// Token API «général» (pour /send-*, /contacts, etc.) — on accepte RESOLVER_BEARER aussi
+// Token par défaut pour les endpoints protégés
 const AUTH_TOKEN =
-  process.env.RESOLVER_BEARER ||
+  process.env.RESOLVER_BEARER || // on garde la même valeur pour simplifier les tests
   process.env.AUTH_TOKEN ||
   'MY_PRIVATE_FURIA_API_KEY_2025'
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const hdr = String(req.headers['authorization'] || '')
+  const hdr = (req.headers['authorization'] || '').toString()
   const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
   if (!got || got !== AUTH_TOKEN) {
     return res.status(403).json({ ok: false, error: 'forbidden' })
@@ -47,7 +55,7 @@ type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: n
 
 const contactsMap = new Map<string, Contact>()
 const chatsMap    = new Map<string, Chat>()
-const msgMap      = new Map<string, any[]>() // messages par JID
+const msgMap      = new Map<string, any[]>() // messages par JID (web messages entiers)
 
 const MSG_CAP = 200
 let currentQR: string | null = null
@@ -214,91 +222,6 @@ async function resetAuthAndRestart() {
   await connectWA()
 }
 
-/* ----------------------- Types & helpers (resolver) -------------- */
-type Dealer = { name?: string; url?: string }
-type Car = {
-  source?: 'next'|'ld'|'scrape'
-  title?: string
-  make?: string
-  model?: string
-  price?: number
-  currency?: string
-  year?: number
-  mileage?: number
-  fuel?: string
-  transmission?: string
-  power_hp?: number
-  images?: string[]
-  url?: string
-  raw?: any
-}
-
-/** Parse partiel de __NEXT_DATA__ pour extraire quelques infos utiles */
-function extractCarFromNext(next: any): Car {
-  try {
-    const json = JSON.stringify(next)
-    const title = /"title":"([^"]+)"/.exec(json)?.[1]
-    const priceStr = /"price":\s*([0-9][0-9.]*)/.exec(json)?.[1]
-    const currency = /"currency":"([A-Z]{3})"/.exec(json)?.[1] || 'CHF'
-    const images = Array.from(
-      new Set([...json.matchAll(/https?:\/\/[^"]+\.(?:jpg|jpeg|png)/gi)].map(m => m[0]))
-    ).slice(0, 12)
-
-    const price = priceStr ? Number(priceStr.replace(/\./g,'')) : undefined
-    return { source:'next', title, price: Number.isFinite(price) ? price : undefined, currency, images, raw: next }
-  } catch {
-    return { source:'next', raw: next }
-  }
-}
-
-/** Mappe JSON-LD (Product/Vehicle) -> Car */
-function mapLdToCar(ld: any): Car {
-  try {
-    const node = Array.isArray(ld)
-      ? (ld.find((x:any) => String(x['@type']||'').toLowerCase().includes('product')) ?? ld[0])
-      : ld
-
-    const offers = node?.offers || {}
-    const imgs = node?.image
-      ? (Array.isArray(node.image) ? node.image : [node.image])
-      : undefined
-
-    return {
-      source: 'ld',
-      title: node?.name,
-      price: offers?.price ? Number(String(offers.price).replace(/\./g,'')) : undefined,
-      currency: offers?.priceCurrency || 'CHF',
-      images: imgs,
-      raw: node,
-    }
-  } catch {
-    return { source:'ld', raw: ld }
-  }
-}
-
-/** Récupère quelques liens de fiches depuis une page garage */
-function scrapeDealerInventory(html: string): { url: string; title?: string }[] {
-  const out: { url: string; title?: string }[] = []
-  const base = 'https://www.autoscout24.ch'
-  const reHref = /href="(\/[a-z]{2}\/d\/[^"]+?)"/gi
-  const seen = new Set<string>()
-  let m: RegExpExecArray | null
-  while ((m = reHref.exec(html))) {
-    const href = m[1]
-    if (seen.has(href)) continue
-    seen.add(href)
-    out.push({ url: href.startsWith('http') ? href : base + href })
-    if (out.length >= 40) break
-  }
-  return out
-}
-
-/** Tente d’estimer le nom du garage depuis <title> */
-function guessDealer(html: string): Dealer {
-  const name = /<title>([^<]+)<\/title>/i.exec(html)?.[1]?.trim()
-  return { name }
-}
-
 /* ----------------------------- routes --------------------------- */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, status: qrStatus, connected: Boolean(sock?.user), user: sock?.user || null })
@@ -345,57 +268,55 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
 })
 
 /* ----------------------- CARS RESOLVER ------------------------ */
-const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
+// On réutilise AUTH_TOKEN pour ces routes (tu peux aussi garder RESOLVER_BEARER séparé si tu veux)
+const RESOLVER_BEARER = process.env.RESOLVER_BEARER || AUTH_TOKEN
 
 function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
   const h = String(req.headers.authorization || '')
   const t = h.startsWith('Bearer ') ? h.slice(7) : ''
-  if (!RESOLVER_BEARER) return res.status(500).json({ ok:false, error:'resolver bearer not set' })
-  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok:false, error:'unauthorized' })
+  if (!RESOLVER_BEARER) return res.status(500).json({ ok: false, error: 'resolver_bearer_not_set' })
+  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok: false, error: 'unauthorized' })
   next()
 }
 
-// Santé (public)
+// Santé
 app.get('/cars/health', (_req, res) => {
   res.json({ ok: true, service: 'cars-resolver', ts: Date.now() })
 })
 
-// Connect (protégé)
+// GET de test: /cars/connect?link=... (ou url=..., href=...)
+app.get('/cars/connect', requireResolverAuth, async (req, res) => {
+  const link = String((req.query.link || req.query.url || req.query.href || '') as string).trim()
+  if (!link) return res.status(400).json({ ok: false, error: 'link required' })
+  const kind = /autoscout24\.ch/i.test(link)
+    ? (/\/d\//i.test(link) ? 'listing' : 'garage')
+    : 'unknown'
+  return res.json({ ok: true, kind, link })
+})
+
+// POST contractuel (ce que l’Edge doit appeler)
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   try {
-    const link = String(req.body.link || '')
-    if (!link) return res.status(400).json({ ok:false, error:'link required' })
-
-    // tolérant au typage "fetch" selon tsconfig
-    const fetchAny: any = (globalThis as any).fetch
-    if (!fetchAny) throw new Error('fetch not available in runtime')
-    const html: string = await fetchAny(link, { headers:{ 'user-agent':'Mozilla/5.0' } }).then((r: any) => r.text())
-
-    // 1) __NEXT_DATA__
-    const mNext = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
-    if (mNext) {
-      const next = JSON.parse(mNext[1])
-      const car = extractCarFromNext(next)
-      return res.json({ ok:true, kind:'listing', car })
+    const raw = (req.body ?? {}) as Record<string, unknown>
+    const link = String((raw.link || raw.url || raw.href || '') as string).trim()
+    if (!link) {
+      logger.warn({ body: raw }, '/cars/connect: missing link')
+      return res.status(400).json({ ok: false, error: 'link required' })
     }
 
-    // 2) JSON-LD
-    const mLd = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)
-    if (mLd) {
-      const ld = JSON.parse(mLd[1])
-      const car = mapLdToCar(ld)
-      return res.json({ ok:true, kind:'listing', car })
-    }
+    // Détection simple pour répondre 200 (stub). Tu brancheras le scraping ensuite.
+    const kind = /autoscout24\.ch/i.test(link)
+      ? (/\/d\//i.test(link) ? 'listing' : 'garage')
+      : 'unknown'
 
-    // 3) Page garage → aperçus de fiches
-    const inventory = scrapeDealerInventory(html)
-    if (inventory.length) {
-      return res.json({ ok:true, kind:'garage', dealer: guessDealer(html), inventory_preview: inventory.slice(0, 10) })
-    }
-
-    return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' })
+    return res.json({
+      ok: true,
+      kind,
+      link,
+      note: 'stub_ok', // marqueur pour valider bout-en-bout
+    })
   } catch (e: any) {
-    res.status(500).json({ ok:false, error:'resolver_crash', details: e?.message })
+    return res.status(500).json({ ok: false, error: 'resolver_crash', details: e?.message })
   }
 })
 
@@ -477,7 +398,7 @@ app.get('/chats', requireAuth, (_req, res) => {
 
 app.get('/messages', requireAuth, async (req, res) => {
   try {
-    const jid = toJid(String(req.query.jid || ''))
+    const jid = toJid((req.query.jid || '').toString())
     const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200))
     const arr = (msgMap.get(jid) || []).slice(-limit)
     res.json({ jid, count: arr.length, messages: arr })
