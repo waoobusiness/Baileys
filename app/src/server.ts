@@ -11,10 +11,8 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   WAMessageKey,
-  jidDecode,
   proto,
 } from '@whiskeysockets/baileys'
-import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
 
@@ -25,14 +23,14 @@ app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
 /* --------------------------- security -------------------------- */
-// Accept either RESOLVER_BEARER (for Lovable) or AUTH_TOKEN (manual/testing)
+// Token API «général» (pour /send-*, /contacts, etc.) — on accepte RESOLVER_BEARER aussi
 const AUTH_TOKEN =
   process.env.RESOLVER_BEARER ||
   process.env.AUTH_TOKEN ||
   'MY_PRIVATE_FURIA_API_KEY_2025'
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const hdr = (req.headers['authorization'] || '').toString()
+  const hdr = String(req.headers['authorization'] || '')
   const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
   if (!got || got !== AUTH_TOKEN) {
     return res.status(403).json({ ok: false, error: 'forbidden' })
@@ -49,7 +47,7 @@ type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: n
 
 const contactsMap = new Map<string, Contact>()
 const chatsMap    = new Map<string, Chat>()
-const msgMap      = new Map<string, any[]>() // messages par JID (web messages entiers)
+const msgMap      = new Map<string, any[]>() // messages par JID
 
 const MSG_CAP = 200
 let currentQR: string | null = null
@@ -216,6 +214,91 @@ async function resetAuthAndRestart() {
   await connectWA()
 }
 
+/* ----------------------- Types & helpers (resolver) -------------- */
+type Dealer = { name?: string; url?: string }
+type Car = {
+  source?: 'next'|'ld'|'scrape'
+  title?: string
+  make?: string
+  model?: string
+  price?: number
+  currency?: string
+  year?: number
+  mileage?: number
+  fuel?: string
+  transmission?: string
+  power_hp?: number
+  images?: string[]
+  url?: string
+  raw?: any
+}
+
+/** Parse partiel de __NEXT_DATA__ pour extraire quelques infos utiles */
+function extractCarFromNext(next: any): Car {
+  try {
+    const json = JSON.stringify(next)
+    const title = /"title":"([^"]+)"/.exec(json)?.[1]
+    const priceStr = /"price":\s*([0-9][0-9.]*)/.exec(json)?.[1]
+    const currency = /"currency":"([A-Z]{3})"/.exec(json)?.[1] || 'CHF'
+    const images = Array.from(
+      new Set([...json.matchAll(/https?:\/\/[^"]+\.(?:jpg|jpeg|png)/gi)].map(m => m[0]))
+    ).slice(0, 12)
+
+    const price = priceStr ? Number(priceStr.replace(/\./g,'')) : undefined
+    return { source:'next', title, price: Number.isFinite(price) ? price : undefined, currency, images, raw: next }
+  } catch {
+    return { source:'next', raw: next }
+  }
+}
+
+/** Mappe JSON-LD (Product/Vehicle) -> Car */
+function mapLdToCar(ld: any): Car {
+  try {
+    const node = Array.isArray(ld)
+      ? (ld.find((x:any) => String(x['@type']||'').toLowerCase().includes('product')) ?? ld[0])
+      : ld
+
+    const offers = node?.offers || {}
+    const imgs = node?.image
+      ? (Array.isArray(node.image) ? node.image : [node.image])
+      : undefined
+
+    return {
+      source: 'ld',
+      title: node?.name,
+      price: offers?.price ? Number(String(offers.price).replace(/\./g,'')) : undefined,
+      currency: offers?.priceCurrency || 'CHF',
+      images: imgs,
+      raw: node,
+    }
+  } catch {
+    return { source:'ld', raw: ld }
+  }
+}
+
+/** Récupère quelques liens de fiches depuis une page garage */
+function scrapeDealerInventory(html: string): { url: string; title?: string }[] {
+  const out: { url: string; title?: string }[] = []
+  const base = 'https://www.autoscout24.ch'
+  const reHref = /href="(\/[a-z]{2}\/d\/[^"]+?)"/gi
+  const seen = new Set<string>()
+  let m: RegExpExecArray | null
+  while ((m = reHref.exec(html))) {
+    const href = m[1]
+    if (seen.has(href)) continue
+    seen.add(href)
+    out.push({ url: href.startsWith('http') ? href : base + href })
+    if (out.length >= 40) break
+  }
+  return out
+}
+
+/** Tente d’estimer le nom du garage depuis <title> */
+function guessDealer(html: string): Dealer {
+  const name = /<title>([^<]+)<\/title>/i.exec(html)?.[1]?.trim()
+  return { name }
+}
+
 /* ----------------------------- routes --------------------------- */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, status: qrStatus, connected: Boolean(sock?.user), user: sock?.user || null })
@@ -272,48 +355,49 @@ function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
   next()
 }
 
-// Santé
+// Santé (public)
 app.get('/cars/health', (_req, res) => {
   res.json({ ok: true, service: 'cars-resolver', ts: Date.now() })
 })
 
+// Connect (protégé)
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   try {
-    const link = String(req.body.link || '');
-    if (!link) return res.status(400).json({ ok:false, error:'link required' });
+    const link = String(req.body.link || '')
+    if (!link) return res.status(400).json({ ok:false, error:'link required' })
 
-    const html = await fetch(link, { headers:{ 'user-agent':'Mozilla/5.0' } }).then(r => r.text());
+    // tolérant au typage "fetch" selon tsconfig
+    const fetchAny: any = (globalThis as any).fetch
+    if (!fetchAny) throw new Error('fetch not available in runtime')
+    const html: string = await fetchAny(link, { headers:{ 'user-agent':'Mozilla/5.0' } }).then((r: any) => r.text())
 
-    // 1) Tenter __NEXT_DATA__ (pages Next.js)
-    const mNext = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+    // 1) __NEXT_DATA__
+    const mNext = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
     if (mNext) {
-      const next = JSON.parse(mNext[1]);
-      // TODO: adapter selon la structure réelle (listing vs dealer)
-      // Exemple simplifié pour une fiche véhicule :
-      const car = extractCarFromNext(next); // à écrire
-      return res.json({ ok:true, kind:'listing', car });
+      const next = JSON.parse(mNext[1])
+      const car = extractCarFromNext(next)
+      return res.json({ ok:true, kind:'listing', car })
     }
 
-    // 2) fallback JSON-LD
-    const mLd = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+    // 2) JSON-LD
+    const mLd = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)
     if (mLd) {
-      const ld = JSON.parse(mLd[1]);
-      // Mapper vers ton schéma normalisé
-      const car = mapLdToCar(ld);
-      return res.json({ ok:true, kind:'listing', car });
+      const ld = JSON.parse(mLd[1])
+      const car = mapLdToCar(ld)
+      return res.json({ ok:true, kind:'listing', car })
     }
 
-    // 3) Si c’est une page garage, parser la liste (cards) & renvoyer un aperçu
-    const inventory = scrapeDealerInventory(html); // à écrire
-    if (inventory?.length) {
-      return res.json({ ok:true, kind:'garage', dealer: guessDealer(html), inventory_preview: inventory.slice(0,10) });
+    // 3) Page garage → aperçus de fiches
+    const inventory = scrapeDealerInventory(html)
+    if (inventory.length) {
+      return res.json({ ok:true, kind:'garage', dealer: guessDealer(html), inventory_preview: inventory.slice(0, 10) })
     }
 
-    return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' });
-  } catch (e:any) {
-    res.status(500).json({ ok:false, error:'resolver_crash', details:e?.message });
+    return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' })
+  } catch (e: any) {
+    res.status(500).json({ ok:false, error:'resolver_crash', details: e?.message })
   }
-});
+})
 
 /* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
@@ -393,7 +477,7 @@ app.get('/chats', requireAuth, (_req, res) => {
 
 app.get('/messages', requireAuth, async (req, res) => {
   try {
-    const jid = toJid((req.query.jid || '').toString())
+    const jid = toJid(String(req.query.jid || ''))
     const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200))
     const arr = (msgMap.get(jid) || []).slice(-limit)
     res.json({ jid, count: arr.length, messages: arr })
