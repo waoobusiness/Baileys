@@ -115,16 +115,21 @@ function parsePhoneFromJid(jid?: string | null) {
 
 async function notifyWebhook(event: string, payload: Record<string, unknown>) {
   if (!WEBHOOK_URL) return;
+  const secret = process.env.WEBHOOK_SECRET || '';
   try {
     await fetch(WEBHOOK_URL, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(secret ? { 'x-webhook-secret': secret } : {})
+      },
       body: JSON.stringify({ event, ...payload })
     });
   } catch (e) {
     logger.warn({ err: e instanceof Error ? e.message : String(e) }, 'webhook post failed');
   }
 }
+
 
 /** ====== START/RESTART SOCKET ====== */
 async function startSock() {
