@@ -1,689 +1,209 @@
-// src/server.ts
-import 'dotenv/config'
-import express, { Request, Response, NextFunction } from 'express'
-import cors from 'cors'
-import pino from 'pino'
-import { Boom } from '@hapi/boom'
-import {
-  WASocket,
-  makeWASocket,
-  useMultiFileAuthState,
+// server.ts
+import express from 'express';
+import cors from 'cors';
+import pino from 'pino';
+import fs from 'fs/promises';
+import path from 'path';
+import QRCode from 'qrcode';
+import makeWASocket, {
   DisconnectReason,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  WAMessageKey,
-  proto,
-} from '@whiskeysockets/baileys'
-import fsp from 'fs/promises'
-import path from 'path'
+  WASocket
+} from '@whiskeysockets/baileys';
 
-/* ------------------------- logger & app ------------------------- */
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
-const app = express()
-app.use(cors())
-app.use(express.json({ limit: '10mb' }))
-app.use(express.urlencoded({ extended: true }))
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+app.use(cors());
 
-/* --------------------------- security -------------------------- */
-// Accept either RESOLVER_BEARER (for Supabase Edge) or AUTH_TOKEN (manual/testing)
-const AUTH_TOKEN =
-  process.env.RESOLVER_BEARER ||
-  process.env.AUTH_TOKEN ||
-  'MY_PRIVATE_FURIA_API_KEY_2025'
+/** ====== ENV ====== */
+const PORT = Number(process.env.PORT || 3001);
+const AUTH_DIR = process.env.AUTH_DIR || path.join(process.cwd(), 'auth');
+const GATEWAY_BEARER = process.env.GATEWAY_AUTH_BEARER || '';
 
-// Token spécifique pour /cars/*
-const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
-// Fallback proxy pour contourner les 403 (ex: Supabase Edge "html-proxy")
-const CARS_PROXY_URL = process.env.CARS_PROXY_URL || '' // ex: https://<project>.functions.supabase.co/html-proxy
+/** ====== STATE ====== */
+let sock: WASocket | null = null;
+let lastQRDataURL: string | null = null;
+let lastQRText: string | null = null;
+let lastStatus: 'pending' | 'qr' | 'connected' | 'closed' = 'pending';
+let restarting = false;
 
-function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const hdr = (req.headers['authorization'] || '').toString()
-  const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
-  if (!got || got !== AUTH_TOKEN) {
-    return res.status(403).json({ ok: false, error: 'forbidden' })
-  }
-  next()
+/** ====== UTILS ====== */
+function requireBearer(req: express.Request, res: express.Response): boolean {
+  const got = (req.headers.authorization || '').trim();
+  const ok = got === `Bearer ${GATEWAY_BEARER}` && GATEWAY_BEARER.length > 0;
+  if (!ok) res.status(403).json({ ok: false, error: 'forbidden' });
+  return ok;
 }
 
-function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
-  const h = String(req.headers.authorization || '')
-  const t = h.startsWith('Bearer ') ? h.slice(7) : ''
-  if (!RESOLVER_BEARER) return res.status(500).json({ ok:false, error:'resolver bearer not set' })
-  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok:false, error:'unauthorized' })
-  next()
+async function wipeAuthDir() {
+  await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  await fs.mkdir(AUTH_DIR, { recursive: true });
+  logger.info({ AUTH_DIR }, 'auth dir wiped & recreated');
 }
 
-/* ------------------------ WA in-memory data --------------------- */
-let sock: WASocket | null = null
-const AUTH_DIR = path.join(process.cwd(), 'auth')
+/** ====== START/RESTART SOCKET ====== */
+async function startSock() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
 
-type Contact = { id: string; name?: string; notify?: string; verifiedName?: string; isBusiness?: boolean }
-type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: number }
-
-const contactsMap = new Map<string, Contact>()
-const chatsMap    = new Map<string, Chat>()
-const msgMap      = new Map<string, any[]>()
-
-const MSG_CAP = 200
-let currentQR: string | null = null
-let qrStatus: 'idle' | 'pending' | 'open' | 'closed' = 'idle'
-
-/* --------------------------- helpers ---------------------------- */
-function toJid(input: string): string {
-  if (!input) throw new Error('destination manquante')
-  const s = input.trim()
-  if (s.endsWith('@s.whatsapp.net') || s.endsWith('@g.us')) return s
-  const num = s.replace(/\D/g, '')
-  if (!num) throw new Error('numéro invalide')
-  return `${num}@s.whatsapp.net`
-}
-
-function pushMessage(m: any) {
-  const jid = m?.key?.remoteJid || ''
-  if (!jid) return
-  const arr = msgMap.get(jid) || []
-  arr.push(m)
-  if (arr.length > MSG_CAP) arr.splice(0, arr.length - MSG_CAP)
-  msgMap.set(jid, arr)
-}
-
-async function resetAuthFolder() {
-  try { await fsp.rm(AUTH_DIR, { recursive: true, force: true }) } catch {}
-  await fsp.mkdir(AUTH_DIR, { recursive: true })
-}
-
-/* ----------------------- WA connection flow --------------------- */
-async function connectWA() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-  const { version } = await fetchLatestBaileysVersion()
-  logger.info({ version }, 'Using WhatsApp version')
+  lastQRDataURL = null;
+  lastQRText = null;
+  lastStatus = 'pending';
 
   sock = makeWASocket({
     version,
     printQRInTerminal: false,
-    browser: ['Zuria.AI', 'Chrome', '1.0.0'],
     auth: state,
-    markOnlineOnConnect: false,
+    browser: ['Zuria.AI Gateway', 'Chrome', '1.0.0'],
     syncFullHistory: false,
-    shouldIgnoreJid: () => false,
-    getMessage: async (key: WAMessageKey): Promise<proto.IMessage | undefined> => {
-      const jid = key.remoteJid || ''
-      const arr = msgMap.get(jid) || []
-      const found = arr.find((m: any) => m?.key?.id === key.id)
-      return (found?.message as proto.IMessage) ?? undefined
-    },
-  })
+  });
 
-  const ev: any = sock.ev
+  sock.ev.on('creds.update', saveCreds);
 
-  ev.on('creds.update', saveCreds)
-
-  ev.on('contacts.set', ({ contacts }: any) => {
-    for (const c of contacts || []) {
-      if (!c?.id) continue
-      contactsMap.set(c.id, {
-        id: c.id,
-        name: c.name,
-        notify: c.notify,
-        verifiedName: c.verifiedName,
-        isBusiness: c.isBusiness,
-      })
-    }
-  })
-
-  ev.on('contacts.update', (updates: any[]) => {
-    for (const u of updates || []) {
-      if (!u?.id) continue
-      const prev = contactsMap.get(u.id) || { id: u.id }
-      contactsMap.set(u.id, { ...(prev as Contact), ...(u as Partial<Contact>) })
-    }
-  })
-
-  ev.on('chats.set', ({ chats, isLatest }: any) => {
-    for (const c of chats || []) {
-      chatsMap.set(c.id, {
-        jid: c.id,
-        name: c.name,
-        unreadCount: c.unreadCount,
-        lastMsgTs: c.lastMsgRecv,
-      } as Chat)
-    }
-    logger.info({ count: (chats || []).length, isLatest }, 'chats.set')
-  })
-
-  ev.on('chats.upsert', (chs: any[]) => {
-    for (const c of chs || []) {
-      chatsMap.set(c.id, {
-        jid: c.id,
-        name: c.name,
-        unreadCount: c.unreadCount,
-        lastMsgTs: c.lastMsgRecv,
-      } as Chat)
-    }
-  })
-
-  ev.on('chats.update', (chs: any[]) => {
-    for (const c of chs || []) {
-      const prev = (chatsMap.get(c.id) as Chat) || ({ jid: c.id } as Chat)
-      chatsMap.set(c.id, { ...prev, name: (c.name ?? prev.name) } as Chat)
-    }
-  })
-
-  ev.on('messages.set', ({ chats, messages, isLatest }: any) => {
-    for (const m of messages || []) pushMessage(m)
-    logger.info({ chats: (chats || []).length, messages: (messages || []).length, isLatest }, 'messages.set')
-  })
-
-  ev.on('messages.upsert', ({ messages }: any) => {
-    for (const m of messages || []) pushMessage(m)
-  })
-
-  ev.on('messages.update', (updates: any[]) => {
-    for (const u of updates || []) {
-      const jid = u?.key?.remoteJid || ''
-      const arr = msgMap.get(jid)
-      if (!arr) continue
-      const idx = arr.findIndex((m: any) => m?.key?.id === u?.key?.id)
-      if (idx >= 0) arr[idx] = { ...arr[idx], ...u }
-    }
-  })
-
-  ev.on('connection.update', async (u: any) => {
-    const { connection, lastDisconnect, qr } = u
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      currentQR = qr
-      qrStatus = 'pending'
-      logger.info('QR ready')
+      try {
+        lastQRText = qr;
+        lastQRDataURL = await QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' });
+        lastStatus = 'qr';
+        logger.info('QR updated (dataURL ready)');
+      } catch (e) {
+        logger.error({ e }, 'QR encode failed');
+      }
     }
 
     if (connection === 'open') {
-      logger.info('WhatsApp connection OPEN')
-      qrStatus = 'open'
-      currentQR = null
-      return
+      lastStatus = 'connected';
+      lastQRDataURL = null;
+      lastQRText = null;
+      logger.info({ jid: sock?.user?.id }, 'WA connected');
     }
 
     if (connection === 'close') {
-      const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
-      logger.warn({ code, reason: (DisconnectReason as any)[code || ''] }, 'connection closed')
-
-      if (code === 515 || code === DisconnectReason.restartRequired) {
-        setTimeout(connectWA, 500)
-        return
+      const code = (lastDisconnect?.error as any)?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      lastStatus = 'closed';
+      logger.warn({ code, shouldReconnect }, 'WA closed');
+      if (shouldReconnect && !restarting) {
+        try {
+          await startSock();
+        } catch (e) {
+          logger.error({ e }, 'auto-reconnect failed');
+        }
       }
-      if (code === 401 || code === DisconnectReason.loggedOut) {
-        await resetAuthAndRestart()
-        return
-      }
-      setTimeout(connectWA, 1000)
     }
-  })
+  });
+
+  sock.ev.on('messages.upsert', (m) => {
+    // raccourci log
+    const cnt = m.messages?.length || 0;
+    logger.debug({ type: m.type, cnt }, 'messages.upsert');
+  });
+
+  return sock;
 }
 
-async function resetAuthAndRestart() {
-  try { if (sock) await sock.logout() } catch {}
-  await resetAuthFolder()
-  currentQR = null
-  qrStatus = 'pending'
-  await connectWA()
-}
-
-/* ----------------------------- routes --------------------------- */
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, status: qrStatus, connected: Boolean(sock?.user), user: sock?.user || null })
-})
-
-app.get('/qr', (_req, res) => {
-  if (qrStatus === 'open') {
-    res.setHeader('content-type', 'text/html; charset=utf-8')
-    return res.end(`
-      <html><head><meta charset="utf-8"><title>WA QR</title>
-      <style>body{font-family:system-ui,Arial;padding:24px}img{border:8px solid #eee;border-radius:16px}</style>
-      </head><body>
-      <h1>Déjà lié ✅</h1>
-      <p>Status: open</p>
-      </body></html>
-    `)
-  }
-  const q = currentQR ? encodeURIComponent(currentQR) : ''
-  res.setHeader('content-type', 'text/html; charset=utf-8')
-  res.end(`
-    <html><head><meta charset="utf-8"><title>WA QR</title>
-    <style>body{font-family:system-ui,Arial;padding:24px}img{border:8px solid #eee;border-radius:16px}</style>
-    </head><body>
-      <h1>Scanne avec WhatsApp</h1>
-      ${currentQR ? `<img width="320" height="320" src="https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${q}" />`
-                   : `<p>QR non prêt…</p>`}
-      <p>Status: ${qrStatus}</p>
-    </body></html>
-  `)
-})
-
-app.get('/qr/json', (_req, res) => {
-  res.json({ status: qrStatus, qr: currentQR })
-})
-
-app.post('/session/reset', requireAuth, async (_req, res) => {
-  await resetAuthAndRestart()
-  res.json({ ok: true })
-})
-
-app.post('/session/reconnect', requireAuth, async (_req, res) => {
-  connectWA()
-  res.json({ ok: true })
-})
-
-/* ----------------------- CARS RESOLVER ------------------------ */
-app.get('/cars/health', (_req, res) => {
-  res.json({ ok: true, service: 'cars-resolver', ts: Date.now(), proxy: !!CARS_PROXY_URL })
-})
-
-type CarNormalized = {
-  url?: string
-  title?: string
-  brand?: string
-  model?: string
-  version?: string
-  year?: number
-  mileage_km?: number
-  fuel?: string
-  gearbox?: string
-  body?: string
-  power_hp?: number
-  price?: number
-  currency?: string
-  images?: string[]
-  location?: string
-  seller?: { name?: string; type?: string }
-}
-
-type InventoryPreview = {
-  url: string
-  title?: string
-  price?: number
-  currency?: string
-}
-
-/* --- util pour accepter link/url partout --- */
-function extractLink(req: Request): string {
-  const h = (s?: string) => (s || '').toString().trim()
-  const fromHeader = h((req.headers as any)['x-link'])
-  const fromQuery  = h((req.query as any)?.link || (req.query as any)?.url)
-  const bodyAny    = (req as any).body || {}
-  const fromBody   = h(bodyAny.link || bodyAny.url)
-
-  const link = fromHeader || fromQuery || fromBody
-  return link
-}
-
-app.post('/cars/connect', requireResolverAuth, async (req, res) => {
+async function hardResetAndRestart() {
+  if (restarting) return;
+  restarting = true;
   try {
-    const link = extractLink(req)
-    if (!link) return res.status(400).json({ ok:false, error:'link required' })
+    try { await sock?.logout?.(); } catch {}
+    try { sock?.ws?.close?.(); } catch {}
+    sock = null;
 
-    const { ok, status, html, viaProxy } = await smartGetHtml(link)
-    if (!ok || !html) {
-      return res.status(502).json({ ok:false, error:'upstream_fetch_failed', details: status === 403 ? 'fetch_failed_403' : `status_${status}` })
+    await wipeAuthDir();
+    await startSock();
+
+    lastStatus = 'pending';
+  } finally {
+    restarting = false;
+  }
+}
+
+/** ====== ROUTES ====== */
+
+// Health
+app.get('/healthz', (_req, res) => res.json({ ok: true, status: lastStatus }));
+
+// Session status
+app.get('/session/status', (_req, res) => {
+  const connected = !!sock?.user;
+  res.json({
+    ok: true,
+    connected,
+    jid: sock?.user?.id || null,
+    status: connected ? 'connected' : lastStatus,
+  });
+});
+
+// Hard reset (secured)
+app.post('/session/reset', async (req, res) => {
+  if (!requireBearer(req, res)) return;
+  try {
+    await hardResetAndRestart();
+    res.json({ ok: true, status: 'pending' });
+  } catch (e) {
+    logger.error({ e }, 'reset failed');
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Optional: start (soft init) if you want a manual kick
+app.post('/session/start', async (_req, res) => {
+  try {
+    if (!sock) await startSock();
+    res.json({ ok: true, status: lastStatus });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// QR endpoint (JSON). If connected + force=1 and auth ok -> hard reset first.
+app.get('/qr', async (req, res) => {
+  const force = String(req.query.force || '') === '1';
+
+  if (sock?.user && force) {
+    if (!requireBearer(req, res)) return;
+    try {
+      await hardResetAndRestart();
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'reset_failed', details: String(e) });
     }
-
-    // 1) NEXT_DATA (Next.js)
-    const next = extractNextJSON(html)
-    if (next) {
-      const carFromNext = extractCarFromNext(next)
-      if (carFromNext) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromNext })
-      const invFromNext = extractInventoryFromNext(next)
-      if (invFromNext?.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html, next), inventory_preview: invFromNext.slice(0, 20) })
-    }
-
-    // 2) JSON-LD
-    const lds = extractAllJsonLd(html)
-    const carFromLd = lds.map(mapLdToCar).find(Boolean)
-    if (carFromLd) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromLd })
-
-    // 3) ItemList
-    const invLD = lds.find(ld => isItemList(ld))
-    if (invLD) {
-      const dealer = guessDealer(html, undefined, invLD)
-      const preview = fromItemList(invLD)
-      if (preview.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer, inventory_preview: preview.slice(0, 20) })
-    }
-
-    // 4) Fallback
-    const invFallback = scrapeDealerInventory(html, link)
-    if (invFallback.length) {
-      return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html), inventory_preview: invFallback.slice(0, 20) })
-    }
-
-    return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' })
-  } catch (e:any) {
-    logger.error({ err: e?.message, stack: e?.stack }, 'cars_connect_crash')
-    res.status(500).json({ ok:false, error:'resolver_crash', details:e?.message })
   }
-})
 
-/* --------------------- fetch & parsing helpers ------------------ */
-function isAutoScout(url: string) {
+  if (sock?.user) {
+    return res.json({ ok: true, status: 'connected', jid: sock.user.id });
+  }
+
+  if (lastStatus === 'qr' && lastQRDataURL) {
+    return res.json({ ok: true, status: 'qr', qr: lastQRDataURL });
+  }
+
+  return res.json({ ok: true, status: lastStatus }); // 'pending' | 'closed'
+});
+
+/** ====== SEND HELPERS (OPTIONNEL, si tu les utilises déjà) ====== */
+app.post('/send-text', async (req, res) => {
   try {
-    const u = new URL(url)
-    return /autoscout24\./i.test(u.hostname)
-  } catch { return false }
-}
-
-async function fetchViaProxy(targetUrl: string): Promise<{ ok: boolean; html?: string; status?: number }> {
-  if (!CARS_PROXY_URL) {
-    logger.warn({ CARS_PROXY_URL }, 'proxy_not_configured')
-    return { ok: false, status: 500 }
+    const { to, text } = req.body as { to: string; text: string };
+    if (!sock) return res.status(503).json({ ok: false, error: 'not_ready' });
+    await sock.sendMessage(to.endsWith('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`, { text });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
   }
-  const proxyUrl = `${CARS_PROXY_URL}?url=${encodeURIComponent(targetUrl)}`
-  logger.info({ proxyUrl: CARS_PROXY_URL, target: targetUrl }, 'using_proxy')
+});
 
-  const r = await fetch(proxyUrl, {
-    headers: {
-      'x-resolver-bearer': RESOLVER_BEARER,
-      'authorization': `Bearer ${RESOLVER_BEARER}`,
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
-      'accept-language': 'fr-CH,fr;q=0.9,en;q=0.8,de;q=0.7',
-      'cache-control': 'no-cache',
-    }
-  })
+/** ====== BOOT ====== */
+(async () => {
+  await fs.mkdir(AUTH_DIR, { recursive: true });
+  await startSock();
 
-  const ct = r.headers.get('content-type') || ''
-  const body = ct.includes('application/json') ? await r.json().catch(() => ({})) : await r.text()
-  if (!r.ok) {
-    logger.warn({ status: r.status, bodyLen: typeof body === 'string' ? body.length : JSON.stringify(body).length }, 'proxy_non200')
-    return { ok: false, status: r.status }
-  }
-
-  if (typeof body === 'string') return { ok: true, html: body, status: 200 }
-  const html = body?.body ?? body?.html ?? ''
-  if (typeof html !== 'string' || !html) return { ok: false, status: 502 }
-  return { ok: true, html, status: 200 }
-}
-
-async function directFetchHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string }> {
-  const headers: Record<string,string> = {
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'accept-language': 'fr-CH,fr;q=0.9,en;q=0.8,de;q=0.7',
-    'cache-control': 'no-cache',
-    'pragma': 'no-cache',
-  }
-  const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
-  const html = await r.text().catch(() => '')
-  return { ok: r.status === 200, status: r.status, html }
-}
-
-async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string; viaProxy?: boolean }> {
-  const forceProxy = (process.env.ALWAYS_PROXY_AUTOSCOUT || '').toLowerCase() === 'true'
-  const targetIsAutoscout = isAutoScout(url)
-
-  // 1) Force proxy si demandé ou si domaine autoscout
-  if (forceProxy || targetIsAutoscout) {
-    const pr = await fetchViaProxy(url)
-    if (pr.ok && pr.html) return { ok: true, status: 200, html: pr.html, viaProxy: true }
-    // si proxy échoue, on tente direct (rarement utile mais sain)
-    const dr = await directFetchHtml(url)
-    if (dr.ok && dr.html) return { ok: true, status: 200, html: dr.html, viaProxy: false }
-    return { ok: false, status: pr.status ?? dr.status ?? 502 }
-  }
-
-  // 2) Sinon, d’abord direct, puis proxy si 403/503
-  const dr = await directFetchHtml(url)
-  if (dr.ok && dr.html) return { ok: true, status: 200, html: dr.html, viaProxy: false }
-
-  if (dr.status === 403 || dr.status === 503) {
-    const pr = await fetchViaProxy(url)
-    if (pr.ok && pr.html) return { ok: true, status: 200, html: pr.html, viaProxy: true }
-    return { ok: false, status: pr.status ?? dr.status }
-  }
-
-  logger.warn({ status: dr.status }, 'smartGetHtml_non200')
-  return { ok: false, status: dr.status }
-}
-
-
-/* --------------------- mapping: JSON-LD → Car ------------------- */
-function mapLdToCar(ld: any): CarNormalized | null {
-  if (!ld || typeof ld !== 'object') return null
-  const type = (ld['@type'] || '').toString().toLowerCase()
-  if (!['vehicle', 'product', 'car'].includes(type)) return null
-
-  const brand = ld.brand?.name || ld.brand
-  const model = ld.model || ld.vehicleModel || ld.name
-  const year  = toInt(ld.modelDate || ld.vehicleModelDate || ld.productionDate || ld.releaseDate)
-
-  let price = getNum(ld.offers?.price)
-  let currency = upperOrUndef(ld.offers?.priceCurrency)
-
-  const mObj = ld.mileageFromOdometer
-  const mileage_km = mObj?.value ? toInt(mObj.value) : toInt(ld.mileage || ld.mileageFromOdometer)
-
-  const fuel = ld.fuelType || ld.fuel || undefined
-  const gearbox = ld.vehicleTransmission || ld.transmission || undefined
-  const power_hp = toInt(ld.power) || toInt(ld.enginePower?.value)
-  const images = Array.isArray(ld.image) ? ld.image : (ld.image ? [ld.image] : undefined)
-
-  const sellerName = ld.seller?.name || ld.brand?.name
-  const sellerType = ld.seller?.['@type']
-
-  const title = ld.name || [brand, model, year].filter(Boolean).join(' ')
-  const url = ld.url
-
-  if (!brand && !model && !price && !year && !images?.length) return null
-
-  return {
-    url, title,
-    brand, model,
-    version: undefined,
-    year: year,
-    mileage_km,
-    fuel: fuel?.toString(),
-    gearbox: gearbox?.toString(),
-    body: ld.bodyType || undefined,
-    power_hp,
-    price,
-    currency,
-    images,
-    location: ld.offers?.availableAtOrFrom?.address?.addressLocality,
-    seller: (sellerName || sellerType) ? { name: sellerName, type: sellerType } : undefined,
-  }
-}
-
-/* -------------- mapping: ItemList(JSON-LD) → inventory --------- */
-function fromItemList(ld: any): InventoryPreview[] {
-  const items: InventoryPreview[] = []
-  const list = Array.isArray(ld?.itemListElement) ? ld.itemListElement : []
-  for (const el of list) {
-    const item = el?.item || el
-    if (!item) continue
-
-    const url = (item.url || el.url || '').toString()
-    if (!url) continue
-
-    const title = (item.name || el.name || '').toString() || undefined
-    const price = getNum(item?.offers?.price ?? el?.offers?.price)
-
-    const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
-    const currency = String(currencyRaw).toUpperCase() || undefined
-
-    items.push({ url, title, price, currency })
-  }
-  return items
-}
-
-/* --------------------- NEXT_DATA → Car / Inventory ------------- */
-function extractCarFromNext(next: any): CarNormalized | null {
-  if (!next || typeof next !== 'object') return null
-  const candidate = deepPick(next, ['listing', 'ad', 'vehicle', 'car', 'detail'])
-  if (!candidate || typeof candidate !== 'object') return null
-
-  const brand = candidate.brand?.name || candidate.brand || candidate.makeName || candidate.make
-  const model = candidate.modelName || candidate.model || candidate.type
-  const year  = toInt(candidate.firstRegistrationYear || candidate.year || candidate.registrationYear)
-  const mileage_km = toInt(candidate.mileage || candidate.mileageKm || candidate.odometer)
-  const price = getNum(candidate.price?.amount ?? candidate.price ?? candidate.priceValue)
-  const currency = upperOrUndef(candidate.price?.currency ?? candidate.currency)
-  const title = candidate.title || [brand, model, year].filter(Boolean).join(' ')
-  const images = Array.isArray(candidate.images)
-    ? candidate.images.map((i:any) => i?.url || i).filter(Boolean)
-    : undefined
-
-  if (!brand && !model && !price && !year && !images?.length) return null
-
-  return {
-    title,
-    brand: brand?.toString(),
-    model: model?.toString(),
-    year,
-    mileage_km,
-    price,
-    currency,
-    images,
-    fuel: candidate.fuelType || candidate.fuel,
-    gearbox: candidate.transmission,
-    power_hp: toInt(candidate.powerHp || candidate.power),
-    url: candidate.canonicalUrl || candidate.url,
-    seller: candidate.seller ? { name: candidate.seller?.name, type: candidate.seller?.type } : undefined,
-  }
-}
-
-function extractInventoryFromNext(next: any): InventoryPreview[] {
-  const arr: any = deepPick(next, ['inventory', 'list', 'results', 'items', 'cars'])
-  const list = Array.isArray(arr) ? arr : []
-  const out: InventoryPreview[] = []
-  for (const it of list) {
-    const url = (it?.url || it?.canonicalUrl || '').toString()
-    if (!url) continue
-    const title = (it?.title || it?.name || '').toString() || undefined
-    const price = getNum(it?.price?.amount ?? it?.price)
-    const currency = upperOrUndef(it?.price?.currency ?? it?.currency)
-    out.push({ url, title, price, currency })
-  }
-  return out
-}
-
-/* ------------------ Fallback dealer inventory ------------------ */
-function scrapeDealerInventory(html: string, base?: string): InventoryPreview[] {
-  const out: InventoryPreview[] = []
-  const linkRe = /href="([^"]+)"/g
-  let m: RegExpExecArray | null
-  const seen = new Set<string>()
-  while ((m = linkRe.exec(html)) !== null) {
-    let href = m[1]
-    if (href.startsWith('/')) {
-      try {
-        const u = new URL(base || 'https://www.autoscout24.ch')
-        href = `${u.origin}${href}`
-      } catch {}
-    }
-    if (!/^https?:\/\//i.test(href)) continue
-    if (!/autoscout24\.[a-z.]+\/.+\/d\//i.test(href)) continue
-    if (seen.has(href)) continue
-    seen.add(href)
-    out.push({ url: href })
-    if (out.length >= 100) break
-  }
-  return out
-}
-
-function guessDealer(html: string, next?: any, ld?: any): { name?: string } | undefined {
-  const metaName = (html.match(/<meta property="og:site_name" content="([^"]+)"/)?.[1]) ||
-                   (html.match(/<meta property="og:title" content="([^"]+)"/)?.[1]) ||
-                   (html.match(/<title>([^<]+)<\/title>/)?.[1])
-  const ldOrg = (ld && (ld['@type'] === 'AutoDealer' || ld['@type'] === 'Organization')) ? (ld?.name || ld?.legalName) : undefined
-  const nextSeller = next ? deepPick(next, ['seller','dealer','store']) : undefined
-  const name = nextSeller?.name || ldOrg || metaName
-  return name ? { name } : undefined
-}
-
-/* --------- sending: text / image / audio / PTT / reaction ------ */
-app.post('/send-text', requireAuth, async (req, res) => {
-  try {
-    const jid = toJid(req.body.to)
-    const text = (req.body.text || '').toString()
-    if (!sock) throw new Error('socket not ready')
-    await sock.sendMessage(jid, { text })
-    res.json({ ok: true })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-app.post('/send-image', requireAuth, async (req, res) => {
-  try {
-    const jid = toJid(req.body.to)
-    const url = (req.body.url || '').toString()
-    const caption = (req.body.caption || '').toString()
-    if (!sock) throw new Error('socket not ready')
-    await sock.sendMessage(jid, { image: { url }, caption })
-    res.json({ ok: true })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-app.post('/send-audio', requireAuth, async (req, res) => {
-  try {
-    const jid = toJid(req.body.to)
-    const url = (req.body.url || '').toString()
-    if (!sock) throw new Error('socket not ready')
-    await sock.sendMessage(jid, { audio: { url }, mimetype: 'audio/mpeg' })
-    res.json({ ok: true })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-app.post('/send-ptt', requireAuth, async (req, res) => {
-  try {
-    const jid = toJid(req.body.to)
-    const url = (req.body.url || '').toString()
-    if (!sock) throw new Error('socket not ready')
-    await sock.sendMessage(jid, { audio: { url }, ptt: true, mimetype: 'audio/ogg' })
-    res.json({ ok: true })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-app.post('/react', requireAuth, async (req, res) => {
-  try {
-    if (!sock) throw new Error('socket not ready')
-    const jid = toJid(req.body.jid)
-    const id = (req.body.id || '').toString()
-    const emoji = (req.body.emoji || '').toString()
-    const participant = (req.body.participant || '').toString() || undefined
-    const key: WAMessageKey = { id, remoteJid: jid, fromMe: false, participant }
-    await sock.sendMessage(jid, { react: { text: emoji, key } })
-    res.json({ ok: true })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-/* ---------------------- data listing APIs ---------------------- */
-app.get('/contacts', requireAuth, (_req, res) => {
-  const contacts = Array.from(contactsMap.values())
-  res.json({ count: contacts.length, contacts })
-})
-
-app.get('/chats', requireAuth, (_req, res) => {
-  const chats = Array.from(chatsMap.values())
-  res.json({ count: chats.length, chats })
-})
-
-app.get('/messages', requireAuth, async (req, res) => {
-  try {
-    const jid = toJid((req.query.jid || '').toString())
-    const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200))
-    const arr = (msgMap.get(jid) || []).slice(-limit)
-    res.json({ jid, count: arr.length, messages: arr })
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message })
-  }
-})
-
-/* ---------------------------- start ---------------------------- */
-const PORT = Number(process.env.PORT || 10000)
-app.listen(PORT, () => logger.info(`HTTP server listening on :${PORT}`))
-connectWA().catch(err => logger.error(err, 'connectWA failed'))
+  app.listen(PORT, () => {
+    logger.info({ PORT, AUTH_DIR }, 'Zuria.AI Baileys Gateway up');
+  });
+})();
