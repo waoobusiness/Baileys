@@ -20,6 +20,7 @@ app.use(cors());
 const PORT = Number(process.env.PORT || 3001);
 const AUTH_DIR = process.env.AUTH_DIR || path.join(process.cwd(), 'auth');
 const GATEWAY_BEARER = process.env.GATEWAY_AUTH_BEARER || '';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // <- optionnel: Lovable/Supabase webhook pour session.connected
 
 /** ====== STATE ====== */
 let sock: WASocket | null = null;
@@ -28,7 +29,7 @@ let lastQRText: string | null = null;
 let lastStatus: 'pending' | 'qr' | 'connected' | 'closed' = 'pending';
 let restarting = false;
 
-/** ====== QR LIB (lazy import pour éviter crash si non installée) ====== */
+/** ====== QR LIB (lazy) ====== */
 type QRLib = typeof import('qrcode');
 let QRCodeLib: QRLib | null = null;
 async function ensureQRCodeLib(): Promise<QRLib | null> {
@@ -42,6 +43,57 @@ async function ensureQRCodeLib(): Promise<QRLib | null> {
   }
 }
 
+/** ====== SSE (Server-Sent Events) ====== */
+type SSEClient = { res: express.Response; ping: NodeJS.Timeout };
+const sseClients = new Set<SSEClient>();
+
+function sseWrite(res: express.Response, event: string, data: unknown) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sseBroadcast(event: string, data: unknown) {
+  for (const c of sseClients) {
+    try { sseWrite(c.res, event, data); } catch {}
+  }
+}
+
+app.get('/events', (req, res) => {
+  // headers SSE
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+
+  // CORS explicite utile pour SSE
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  // ping keep-alive
+  const ping = setInterval(() => res.write(': ping\n\n'), 15000);
+  const client: SSEClient = { res, ping };
+  sseClients.add(client);
+
+  // état initial
+  const connected = !!sock?.user;
+  sseWrite(res, 'status', {
+    ok: true,
+    status: connected ? 'connected' : lastStatus,
+    jid: sock?.user?.id || null
+  });
+  if (lastStatus === 'qr') {
+    sseWrite(res, 'qr', {
+      qr: lastQRDataURL ?? null,
+      qrDataURL: lastQRDataURL ?? null,
+      text: lastQRText ?? null,
+      qrText: lastQRText ?? null
+    });
+  }
+
+  req.on('close', () => {
+    clearInterval(ping);
+    sseClients.delete(client);
+  });
+});
+
 /** ====== UTILS ====== */
 function requireBearer(req: express.Request, res: express.Response): boolean {
   const got = (req.headers.authorization || '').trim();
@@ -54,6 +106,24 @@ async function wipeAuthDir() {
   await fs.rm(AUTH_DIR, { recursive: true, force: true });
   await fs.mkdir(AUTH_DIR, { recursive: true });
   logger.info({ AUTH_DIR }, 'auth dir wiped & recreated');
+}
+
+function parsePhoneFromJid(jid?: string | null) {
+  if (!jid) return null;
+  try { return jid.split('@')[0].split(':')[0] || null; } catch { return null; }
+}
+
+async function notifyWebhook(event: string, payload: Record<string, unknown>) {
+  if (!WEBHOOK_URL) return;
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event, ...payload })
+    });
+  } catch (e) {
+    logger.warn({ err: e instanceof Error ? e.message : String(e) }, 'webhook post failed');
+  }
 }
 
 /** ====== START/RESTART SOCKET ====== */
@@ -94,13 +164,28 @@ async function startSock() {
         lastQRDataURL = null;
         logger.error({ err: e instanceof Error ? e.message : String(e) }, 'QR encode failed');
       }
+      // PUSH temps réel au front
+      sseBroadcast('qr', {
+        qr: lastQRDataURL ?? null,
+        qrDataURL: lastQRDataURL ?? null,
+        text: lastQRText ?? null,
+        qrText: lastQRText ?? null
+      });
+      sseBroadcast('status', { status: 'qr' });
     }
 
     if (connection === 'open') {
       lastStatus = 'connected';
+      const jid = sock?.user?.id || null;
+      const phone = parsePhoneFromJid(jid);
       lastQRDataURL = null;
       lastQRText = null;
-      logger.info({ jid: sock?.user?.id }, 'WA connected');
+      logger.info({ jid }, 'WA connected');
+
+      // PUSH temps réel: front + webhook
+      sseBroadcast('connected', { jid, phone });
+      sseBroadcast('status', { status: 'connected', jid, phone });
+      await notifyWebhook('session.connected', { jid, phone });
     }
 
     if (connection === 'close') {
@@ -108,6 +193,10 @@ async function startSock() {
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       lastStatus = 'closed';
       logger.warn({ code, shouldReconnect }, 'WA closed');
+
+      sseBroadcast('closed', { code, shouldReconnect });
+      sseBroadcast('status', { status: 'closed', code });
+
       if (shouldReconnect && !restarting) {
         try {
           await startSock();
@@ -138,31 +227,26 @@ async function hardResetAndRestart() {
     await startSock();
 
     lastStatus = 'pending';
+    sseBroadcast('status', { status: 'pending' });
   } finally {
     restarting = false;
   }
 }
 
 /** ====== ROUTES ====== */
-// ✅ Health endpoints + root
+// Health / root
 app.get('/', (_req, res) => res.json({ ok: true, status: 'up', health: ['/health','/healthz'] }));
 app.get('/health', (_req, res) => res.json({ ok: true, status: 'up' }));
 app.head('/health', (_req, res) => res.status(200).end());
 app.get('/healthz', (_req, res) => res.json({ ok: true, status: 'up' }));
 app.head('/healthz', (_req, res) => res.status(200).end());
 
-// Health
-app.get('/healthz', (_req, res) => res.json({ ok: true, status: lastStatus }));
-
 // Session status
 app.get('/session/status', (_req, res) => {
   const connected = !!sock?.user;
-  res.json({
-    ok: true,
-    connected,
-    jid: sock?.user?.id || null,
-    status: connected ? 'connected' : lastStatus,
-  });
+  const jid = sock?.user?.id || null;
+  const phone = parsePhoneFromJid(jid);
+  res.json({ ok: true, connected, jid, phone, status: connected ? 'connected' : lastStatus });
 });
 
 // Hard reset (secured)
@@ -197,13 +281,14 @@ app.get('/qr', async (req, res) => {
     }
 
     if (sock?.user) {
-      return res.json({ ok: true, status: 'connected', jid: sock.user.id });
+      const jid = sock.user.id;
+      const phone = parsePhoneFromJid(jid);
+      return res.json({ ok: true, status: 'connected', jid, phone });
     }
 
     if (lastStatus === 'qr') {
       const dataURL = lastQRDataURL ?? null;
       const text = lastQRText ?? null;
-      // Back-compat (qr/text) + nouveau schéma (qrDataURL/qrText)
       return res.json({
         ok: true,
         status: 'qr',
@@ -239,7 +324,6 @@ app.post('/send-text', async (req, res) => {
 (async () => {
   await fs.mkdir(AUTH_DIR, { recursive: true });
   await startSock();
-
   app.listen(PORT, () => {
     logger.info({ PORT, AUTH_DIR }, 'Zuria.AI Baileys Gateway up');
   });
