@@ -1,6 +1,7 @@
 // src/server.ts
 import 'dotenv/config'
 import express, { Request, Response, NextFunction } from 'express'
+import carsConnectRouter, { carsConnectParsers } from "./cars-connect";
 import cors from 'cors'
 import pino from 'pino'
 import { Boom } from '@hapi/boom'
@@ -19,15 +20,14 @@ import path from 'path'
 /* ------------------------- logger & app ------------------------- */
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const app = express()
-
-/** Parsers (ordre important) */
+app.use(carsConnectParsers);
+app.use("/cars", carsConnectRouter);
 app.use(cors())
-app.use(express.text({ type: ['text/plain', 'text/*'], limit: '2mb' }))          // bodies textuels
-app.use(express.urlencoded({ extended: true, limit: '2mb' }))                     // x-www-form-urlencoded
-app.use(express.json({ strict: false, limit: '10mb' }))                           // JSON permissif
+app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ extended: true }))
 
 /* --------------------------- security -------------------------- */
-// Accept either RESOLVER_BEARER (for Lovable) or AUTH_TOKEN (manual/testing)
+// Accept either RESOLVER_BEARER (for Supabase Edge) or AUTH_TOKEN (manual/testing)
 const AUTH_TOKEN =
   process.env.RESOLVER_BEARER ||
   process.env.AUTH_TOKEN ||
@@ -35,10 +35,8 @@ const AUTH_TOKEN =
 
 // Token spécifique pour /cars/*
 const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
-
-// Fallback proxy pour contourner les 403 (ex: Supabase Edge function "html-proxy")
-// ex: https://<project>.functions.supabase.co/html-proxy
-const CARS_PROXY_URL = process.env.CARS_PROXY_URL || ''
+// Fallback proxy pour contourner les 403 (ex: Supabase Edge "html-proxy")
+const CARS_PROXY_URL = process.env.CARS_PROXY_URL || '' // ex: https://<project>.functions.supabase.co/html-proxy
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const hdr = (req.headers['authorization'] || '').toString()
@@ -66,7 +64,7 @@ type Chat    = { jid: string; name?: string; unreadCount?: number; lastMsgTs?: n
 
 const contactsMap = new Map<string, Contact>()
 const chatsMap    = new Map<string, Chat>()
-const msgMap      = new Map<string, any[]>() // messages par JID (web messages entiers)
+const msgMap      = new Map<string, any[]>()
 
 const MSG_CAP = 200
 let currentQR: string | null = null
@@ -94,89 +92,6 @@ function pushMessage(m: any) {
 async function resetAuthFolder() {
   try { await fsp.rm(AUTH_DIR, { recursive: true, force: true }) } catch {}
   await fsp.mkdir(AUTH_DIR, { recursive: true })
-}
-
-/** Masque les headers sensibles pour debug */
-function maskHeaders(h: Record<string, any>) {
-  const out: Record<string, any> = {}
-  for (const [k, v] of Object.entries(h || {})) {
-    const lk = k.toLowerCase()
-    out[k] = (lk === 'authorization' || lk.includes('token')) ? '***' : v
-  }
-  return out
-}
-
-function isProbablyUrl(v: unknown): v is string {
-  if (typeof v !== 'string') return false
-  const s = v.trim()
-  if (!s) return false
-  try {
-    new URL(s.startsWith('http') ? s : `https://${s}`)
-    return true
-  } catch { return false }
-}
-
-/** Recherche récursive d'un champ url/link/uri dans un objet */
-function deepFindLink(obj: unknown, depth = 0): string | null {
-  if (depth > 6 || obj == null) return null
-  if (typeof obj === 'string') return isProbablyUrl(obj) ? obj.trim() : null
-  if (typeof obj !== 'object') return null
-
-  const direct = (obj as any)['link'] || (obj as any)['url'] || (obj as any)['uri']
-  if (isProbablyUrl(direct)) return String(direct).trim()
-
-  const candidates = ['data','payload','record','input','inputs','args','event','body','message','params']
-  for (const k of candidates) {
-    const v = (obj as any)[k]
-    const found = deepFindLink(v, depth + 1)
-    if (found) return found
-  }
-  for (const v of Object.values(obj as Record<string, unknown>)) {
-    const found = deepFindLink(v, depth + 1)
-    if (found) return found
-  }
-  return null
-}
-
-/** Extraction robuste du lien quelle que soit la forme d'entrée */
-function extractLink(req: Request): { link: string | null; debug: any } {
-  // header
-  const hLink = req.header('x-link')
-  if (isProbablyUrl(hLink)) return { link: hLink!.trim(), debug: { via: 'header' } }
-
-  // query
-  const q: any = req.query || {}
-  const qLink = q.link || q.url || q.uri
-  if (isProbablyUrl(qLink)) return { link: String(qLink).trim(), debug: { via: 'query' } }
-
-  // body
-  const ct = String(req.headers['content-type'] || '').toLowerCase()
-  let body: any = req.body
-
-  // text/plain → soit URL directe, soit JSON/URL-encoded déguisé
-  if ((!ct || ct.includes('text/plain')) && typeof body === 'string') {
-    const text = body.trim()
-    if (isProbablyUrl(text)) return { link: text, debug: { via: 'text_body' } }
-    try { body = JSON.parse(text) } catch {
-      try {
-        const sp = new URLSearchParams(text)
-        const f = sp.get('link') || sp.get('url') || sp.get('uri')
-        if (isProbablyUrl(f)) return { link: f!.trim(), debug: { via: 'formish_text' } }
-      } catch {}
-    }
-  }
-
-  if (ct.includes('application/x-www-form-urlencoded') && body && typeof body === 'object') {
-    const f = body.link || body.url || body.uri
-    if (isProbablyUrl(f)) return { link: String(f).trim(), debug: { via: 'urlencoded' } }
-  }
-
-  if (body != null) {
-    const found = deepFindLink(body)
-    if (found) return { link: found, debug: { via: 'json_deep' } }
-  }
-
-  return { link: null, debug: { via: 'none', ct, hasBody: body != null, bodyType: typeof body } }
 }
 
 /* ----------------------- WA connection flow --------------------- */
@@ -362,7 +277,6 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
 })
 
 /* ----------------------- CARS RESOLVER ------------------------ */
-// Santé
 app.get('/cars/health', (_req, res) => {
   res.json({ ok: true, service: 'cars-resolver', ts: Date.now(), proxy: !!CARS_PROXY_URL })
 })
@@ -393,50 +307,43 @@ type InventoryPreview = {
   currency?: string
 }
 
+/* --- util pour accepter link/url partout --- */
+function extractLink(req: Request): string {
+  const h = (s?: string) => (s || '').toString().trim()
+  const fromHeader = h((req.headers as any)['x-link'])
+  const fromQuery  = h((req.query as any)?.link || (req.query as any)?.url)
+  const bodyAny    = (req as any).body || {}
+  const fromBody   = h(bodyAny.link || bodyAny.url)
+
+  const link = fromHeader || fromQuery || fromBody
+  return link
+}
+
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   try {
-    const { link, debug } = extractLink(req)
-    if (!link) {
-      return res.status(400).json({
-        ok: false,
-        error: 'link required',
-        debug: {
-          ...debug,
-          headers: maskHeaders(req.headers as any),
-          query: req.query,
-          bodyPreview:
-            typeof req.body === 'string' ? req.body.slice(0, 300)
-            : req.body && typeof req.body === 'object' ? Object.keys(req.body).slice(0, 20)
-            : typeof req.body,
-        },
-      })
-    }
+    const link = extractLink(req)
+    if (!link) return res.status(400).json({ ok:false, error:'link required' })
 
     const { ok, status, html, viaProxy } = await smartGetHtml(link)
     if (!ok || !html) {
-      return res.status(502).json({
-        ok:false,
-        error:'upstream_fetch_failed',
-        details: status === 403 ? 'fetch_failed_403' : `status_${status}`
-      })
+      return res.status(502).json({ ok:false, error:'upstream_fetch_failed', details: status === 403 ? 'fetch_failed_403' : `status_${status}` })
     }
 
     // 1) NEXT_DATA (Next.js)
     const next = extractNextJSON(html)
     if (next) {
-      const carFromNext = extractCarFromNext(next) // heuristique
+      const carFromNext = extractCarFromNext(next)
       if (carFromNext) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromNext })
       const invFromNext = extractInventoryFromNext(next)
       if (invFromNext?.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html, next), inventory_preview: invFromNext.slice(0, 20) })
     }
 
-    // 2) JSON-LD (peut être multiple)
+    // 2) JSON-LD
     const lds = extractAllJsonLd(html)
-    // chercher VEHICLE ou PRODUCT
     const carFromLd = lds.map(mapLdToCar).find(Boolean)
     if (carFromLd) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromLd })
 
-    // 3) Inventory / ItemList
+    // 3) ItemList
     const invLD = lds.find(ld => isItemList(ld))
     if (invLD) {
       const dealer = guessDealer(html, undefined, invLD)
@@ -444,7 +351,7 @@ app.post('/cars/connect', requireResolverAuth, async (req, res) => {
       if (preview.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer, inventory_preview: preview.slice(0, 20) })
     }
 
-    // 4) Fallback: heuristique de liens de fiches
+    // 4) Fallback
     const invFallback = scrapeDealerInventory(html, link)
     if (invFallback.length) {
       return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html), inventory_preview: invFallback.slice(0, 20) })
@@ -468,16 +375,16 @@ async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number
   }
 
   try {
-    const r = await fetch(url, { headers, redirect: 'follow' as any })
+    const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
     if (r.status === 200) {
       const html = await r.text()
       return { ok: true, status: 200, html, viaProxy: false }
     }
-    // 301/302 suivis automatiquement; si 403/503 → fallback proxy
     if (r.status === 403 || r.status === 503) {
       if (!CARS_PROXY_URL) return { ok:false, status: r.status }
-      // proxy simple: GET ?url=encoded
-      const pr = await fetch(`${CARS_PROXY_URL}?url=${encodeURIComponent(url)}`, { headers: { 'x-resolver-bearer': RESOLVER_BEARER } })
+      const pr = await fetch(`${CARS_PROXY_URL}?url=${encodeURIComponent(url)}`, {
+        headers: { 'x-resolver-bearer': RESOLVER_BEARER }
+      })
       if (!pr.ok) return { ok:false, status: pr.status }
       const ct = pr.headers.get('content-type') || ''
       if (ct.includes('application/json')) {
@@ -491,7 +398,6 @@ async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number
         return { ok:false, status: 502 }
       }
     }
-    // autres codes
     const txt = await r.text().catch(() => '')
     logger.warn({ status: r.status, len: txt?.length }, 'smartGetHtml_non200')
     return { ok:false, status: r.status }
@@ -505,9 +411,7 @@ function extractNextJSON(html: string): any | null {
   const re = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/
   const m = html.match(re)
   if (!m) return null
-  try {
-    return JSON.parse(m[1])
-  } catch { return null }
+  try { return JSON.parse(m[1]) } catch { return null }
 }
 
 function extractAllJsonLd(html: string): any[] {
@@ -520,9 +424,7 @@ function extractAllJsonLd(html: string): any[] {
       const parsed = JSON.parse(raw)
       if (Array.isArray(parsed)) out.push(...parsed)
       else out.push(parsed)
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
   return out
 }
@@ -547,7 +449,7 @@ function deepPick(obj: any, keys: string[]): any {
 }
 
 function getNum(val: any): number | undefined {
-  if (val == null) return undefined
+  if (val === null || val === undefined) return undefined
   const s = String(val).replace(/\s/g, '')
   const m = s.match(/-?\d+(?:[.,]\d+)?/)
   if (!m) return undefined
@@ -575,11 +477,9 @@ function mapLdToCar(ld: any): CarNormalized | null {
   const model = ld.model || ld.vehicleModel || ld.name
   const year  = toInt(ld.modelDate || ld.vehicleModelDate || ld.productionDate || ld.releaseDate)
 
-  // price
   let price = getNum(ld.offers?.price)
   let currency = upperOrUndef(ld.offers?.priceCurrency)
 
-  // mileage
   const mObj = ld.mileageFromOdometer
   const mileage_km = mObj?.value ? toInt(mObj.value) : toInt(ld.mileage || ld.mileageFromOdometer)
 
@@ -594,9 +494,7 @@ function mapLdToCar(ld: any): CarNormalized | null {
   const title = ld.name || [brand, model, year].filter(Boolean).join(' ')
   const url = ld.url
 
-  if (!brand && !model && !price && !year && !images?.length) {
-    return null
-  }
+  if (!brand && !model && !price && !year && !images?.length) return null
 
   return {
     url, title,
@@ -630,10 +528,8 @@ function fromItemList(ld: any): InventoryPreview[] {
     const title = (item.name || el.name || '').toString() || undefined
     const price = getNum(item?.offers?.price ?? el?.offers?.price)
 
-    // Évite TS5076: pas de mélange ?? et || sans parenthèses
     const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
-    const cur = String(currencyRaw).trim()
-    const currency = cur ? cur.toUpperCase() : undefined
+    const currency = String(currencyRaw).toUpperCase() || undefined
 
     items.push({ url, title, price, currency })
   }
@@ -643,7 +539,6 @@ function fromItemList(ld: any): InventoryPreview[] {
 /* --------------------- NEXT_DATA → Car / Inventory ------------- */
 function extractCarFromNext(next: any): CarNormalized | null {
   if (!next || typeof next !== 'object') return null
-  // Heuristique : chercher un objet "listing"/"ad"/"vehicle" avec marque, modèle, prix
   const candidate = deepPick(next, ['listing', 'ad', 'vehicle', 'car', 'detail'])
   if (!candidate || typeof candidate !== 'object') return null
 
@@ -678,7 +573,6 @@ function extractCarFromNext(next: any): CarNormalized | null {
 }
 
 function extractInventoryFromNext(next: any): InventoryPreview[] {
-  // Cherche une liste d’items avec url + name + price
   const arr: any = deepPick(next, ['inventory', 'list', 'results', 'items', 'cars'])
   const list = Array.isArray(arr) ? arr : []
   const out: InventoryPreview[] = []
@@ -708,7 +602,6 @@ function scrapeDealerInventory(html: string, base?: string): InventoryPreview[] 
       } catch {}
     }
     if (!/^https?:\/\//i.test(href)) continue
-    // heuristique: fiches autoscout contiennent "/d/" (detail)
     if (!/autoscout24\.[a-z.]+\/.+\/d\//i.test(href)) continue
     if (seen.has(href)) continue
     seen.add(href)
