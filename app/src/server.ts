@@ -277,26 +277,43 @@ app.get('/cars/health', (_req, res) => {
   res.json({ ok: true, service: 'cars-resolver', ts: Date.now() })
 })
 
-// Connect: reçoit un lien (listing AutoScout24 ou page garage)
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
-  // ✅ tolérant : accepte link, url ou href
-  const link = String(req.body.link || req.body.url || req.body.href || '').trim()
-  if (!link) return res.status(400).json({ ok:false, error:'link required' })
+  try {
+    const link = String(req.body.link || '');
+    if (!link) return res.status(400).json({ ok:false, error:'link required' });
 
-  const kind = /autoscout24/i.test(link)
-    ? (/\/d\//.test(link) ? 'listing' : 'garage')
-    : 'unknown'
+    const html = await fetch(link, { headers:{ 'user-agent':'Mozilla/5.0' } }).then(r => r.text());
 
-  return res.json({ ok:true, kind, link })
-})
+    // 1) Tenter __NEXT_DATA__ (pages Next.js)
+    const mNext = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+    if (mNext) {
+      const next = JSON.parse(mNext[1]);
+      // TODO: adapter selon la structure réelle (listing vs dealer)
+      // Exemple simplifié pour une fiche véhicule :
+      const car = extractCarFromNext(next); // à écrire
+      return res.json({ ok:true, kind:'listing', car });
+    }
 
+    // 2) fallback JSON-LD
+    const mLd = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+    if (mLd) {
+      const ld = JSON.parse(mLd[1]);
+      // Mapper vers ton schéma normalisé
+      const car = mapLdToCar(ld);
+      return res.json({ ok:true, kind:'listing', car });
+    }
 
-// (facultatif) Preview
-app.post('/cars/preview', requireResolverAuth, async (req, res) => {
-  const link = String(req.body.link || '')
-  if (!link) return res.status(400).json({ ok:false, error:'link required' })
-  return res.json({ ok:true, preview:true, link })
-})
+    // 3) Si c’est une page garage, parser la liste (cards) & renvoyer un aperçu
+    const inventory = scrapeDealerInventory(html); // à écrire
+    if (inventory?.length) {
+      return res.json({ ok:true, kind:'garage', dealer: guessDealer(html), inventory_preview: inventory.slice(0,10) });
+    }
+
+    return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' });
+  } catch (e:any) {
+    res.status(500).json({ ok:false, error:'resolver_crash', details:e?.message });
+  }
+});
 
 /* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
