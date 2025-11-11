@@ -29,12 +29,25 @@ const AUTH_TOKEN =
   process.env.AUTH_TOKEN ||
   'MY_PRIVATE_FURIA_API_KEY_2025'
 
+// Token spécifique pour /cars/*
+const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
+// Fallback proxy pour contourner les 403 (ex: Supabase Edge function "html-proxy")
+const CARS_PROXY_URL = process.env.CARS_PROXY_URL || '' // ex: https://<project>.functions.supabase.co/html-proxy
+
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const hdr = (req.headers['authorization'] || '').toString()
   const got = hdr.startsWith('Bearer ') ? hdr.slice(7) : ''
   if (!got || got !== AUTH_TOKEN) {
     return res.status(403).json({ ok: false, error: 'forbidden' })
   }
+  next()
+}
+
+function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
+  const h = String(req.headers.authorization || '')
+  const t = h.startsWith('Bearer ') ? h.slice(7) : ''
+  if (!RESOLVER_BEARER) return res.status(500).json({ ok:false, error:'resolver bearer not set' })
+  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok:false, error:'unauthorized' })
   next()
 }
 
@@ -214,354 +227,6 @@ async function resetAuthAndRestart() {
   await connectWA()
 }
 
-/* ----------------------- SMART FETCH (anti-bot) ----------------- */
-const SCRAPER_PROVIDER = process.env.SCRAPER_PROVIDER || ''       // e.g. "scraperapi" | "scrapingbee"
-const SCRAPER_API_KEY  = process.env.SCRAPER_API_KEY  || ''
-const SCRAPER_COUNTRY  = process.env.SCRAPER_COUNTRY  || 'ch'
-
-const DESKTOP_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-function blockedHtml(html: string) {
-  const s = html.slice(0, 4096).toLowerCase()
-  return (
-    s.includes("access denied") ||
-    s.includes("request forbidden") ||
-    s.includes("/captcha") ||
-    s.includes("bot detected") ||
-    s.includes("verification required")
-  )
-}
-
-async function fetchDirect(url: string) {
-  const r = await fetch(url, {
-    headers: {
-      "user-agent": DESKTOP_UA,
-      "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "fr-CH,fr;q=0.9,de-CH;q=0.8,en;q=0.7",
-      "upgrade-insecure-requests": "1",
-      "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "none",
-      "sec-fetch-user": "?1",
-    },
-  } as any)
-  const text = await (r as any).text()
-  return { ok: (r as any).ok, status: (r as any).status, text }
-}
-
-async function fetchViaScraper(url: string) {
-  if (!SCRAPER_PROVIDER || !SCRAPER_API_KEY) {
-    return { ok: false, status: 500, text: "scraper_not_configured" }
-  }
-
-  // ScraperAPI — renvoie du HTML brut
-  if (SCRAPER_PROVIDER.toLowerCase() === "scraperapi") {
-    const api = new URL("https://api.scraperapi.com/")
-    api.searchParams.set("api_key", SCRAPER_API_KEY)
-    api.searchParams.set("url", url)
-    if (SCRAPER_COUNTRY) api.searchParams.set("country_code", SCRAPER_COUNTRY)
-
-    const r = await fetch(api.toString(), { headers: { "Accept": "text/html" } } as any)
-    const text = await (r as any).text()
-    return { ok: (r as any).ok, status: (r as any).status, text }
-  }
-
-  // ScrapingBee — alternative
-  if (SCRAPER_PROVIDER.toLowerCase() === "scrapingbee") {
-    const api = new URL("https://app.scrapingbee.com/api/v1/")
-    api.searchParams.set("api_key", SCRAPER_API_KEY)
-    api.searchParams.set("url", url)
-    api.searchParams.set("render_js", "false")
-    if (SCRAPER_COUNTRY) api.searchParams.set("country_code", SCRAPER_COUNTRY)
-    api.searchParams.set("block_ads", "true")
-
-    const r = await fetch(api.toString() as any)
-    const text = await (r as any).text()
-    return { ok: (r as any).ok, status: (r as any).status, text }
-  }
-
-  return { ok: false, status: 500, text: "unknown_scraper_provider" }
-}
-
-async function smartGetHtml(url: string) {
-  // 1) tentative directe
-  try {
-    const d = await fetchDirect(url)
-    if (d.ok && !blockedHtml(d.text)) return d.text
-    if (![403, 429, 503].includes(d.status) && !blockedHtml(d.text)) {
-      // Si ce n'est pas explicitement bloqué mais pas 200 → tentative proxy quand même
-    }
-  } catch { /* ignore */ }
-
-  // 2) fallback via proxy
-  const p = await fetchViaScraper(url)
-  if (p.ok && !blockedHtml(p.text)) return p.text
-
-  const err = new Error("fetch_failed_403") as any
-  err.status = p.status || 502
-  throw err
-}
-
-/* ----------------------- Cars normalisation --------------------- */
-type Car = {
-  title?: string
-  brand?: string
-  model?: string
-  version?: string
-  price?: number
-  currency?: string
-  mileage?: number
-  firstRegistration?: string
-  fuel?: string
-  gearbox?: string
-  powerHp?: number
-  color?: string
-  images?: string[]
-  url?: string
-  vin?: string
-}
-
-function safeJsonParse<T = any>(s: string): T | null {
-  try {
-    return JSON.parse(s)
-  } catch {
-    return null
-  }
-}
-
-function traverse(obj: any, fn: (node: any) => void) {
-  const stack = [obj]
-  const seen = new Set<any>()
-  while (stack.length) {
-    const cur = stack.pop()
-    if (!cur || typeof cur !== 'object' || seen.has(cur)) continue
-    seen.add(cur)
-    fn(cur)
-    if (Array.isArray(cur)) {
-      for (const it of cur) stack.push(it)
-    } else {
-      for (const k of Object.keys(cur)) stack.push((cur as any)[k])
-    }
-  }
-}
-
-function getNum(n: any): number | undefined {
-  if (n == null) return undefined
-  const x = Number(String(n).replace(/[^\d.]/g, ''))
-  return Number.isFinite(x) ? x : undefined
-}
-
-function pick<T extends object, K extends keyof T>(o: T, keys: K[]): Partial<T> {
-  const out: any = {}
-  for (const k of keys) if ((o as any)[k] != null) out[k] = (o as any)[k]
-  return out
-}
-
-/* -------------------- Parsers: NEXT / LD+JSON ------------------- */
-function extractCarFromNext(next: any): Car {
-  // Stratégie générique: parcourir l’objet Next et scorer les nœuds qui ressemblent à une "fiche véhicule"
-  let best: any = null
-  let bestScore = -1
-
-  traverse(next, (node) => {
-    if (!node || typeof node !== 'object') return
-    let score = 0
-    const keys = Object.keys(node)
-
-    const has = (k: string) => keys.includes(k)
-
-    // indices de véhicule fréquents
-    if (has('make') || has('brand')) score += 2
-    if (has('model')) score += 2
-    if (has('price') || has('grossPrice') || has('netPrice') || has('offers')) score += 2
-    if (has('mileage') || has('mileageFromOdometer')) score += 2
-    if (has('firstRegistration') || has('firstRegistrationDate') || has('firstRegYear')) score += 1
-    if (has('fuelType') || has('fuel')) score += 1
-    if (has('gearbox') || has('vehicleTransmission')) score += 1
-    if (has('power') || has('powerHp') || has('kw') || has('hp')) score += 1
-    if (has('images') || has('image')) score += 1
-
-    if (score > bestScore) { bestScore = score; best = node }
-  })
-
-  const c: Car = {}
-
-  if (best) {
-    const brand = (best.brand?.name || best.brand || best.make || '').toString() || undefined
-    const model = (best.model?.name || best.model || '').toString() || undefined
-    const version = (best.version || best.trim || best.equipmentVariant || '').toString() || undefined
-
-    let price = getNum(best.price ?? best.grossPrice ?? best.netPrice ?? best?.offers?.price)
-    const currency =
-      (best.currency || best.priceCurrency || best?.offers?.priceCurrency || '').toString().toUpperCase() || undefined
-
-    let mileage =
-      getNum(best.mileage ?? best.mileageFromOdometer?.value ?? best.odometer ?? best.kilometers ?? best.km)
-
-    const firstRegistration =
-      (best.firstRegistrationDate || best.firstRegistration || best.registrationDate || best.firstRegYear || undefined)?.toString()
-
-    const fuel = (best.fuelType || best.fuel || best.fueltype || '').toString() || undefined
-    const gearbox = (best.vehicleTransmission || best.gearbox || '').toString() || undefined
-    const powerHp =
-      getNum(best.powerHp ?? best.hp ?? (best.power && /(\d+)\s*hp/i.test(String(best.power)) ? RegExp.$1 : undefined))
-
-    const color = (best.color || best.exteriorColor || '').toString() || undefined
-
-    let images: string[] | undefined
-    if (Array.isArray(best.images)) images = best.images.map(String)
-    else if (Array.isArray(best.image)) images = best.image.map(String)
-    else if (typeof best.image === 'string') images = [best.image]
-
-    Object.assign(c, { brand, model, version, price, currency, mileage, firstRegistration, fuel, gearbox, powerHp, color, images })
-  }
-
-  return c
-}
-
-function mapLdToCar(ldRoot: any): Car {
-  // ldRoot peut être un array, ItemList, Vehicle, Product, etc.
-  let ld: any = ldRoot
-  if (Array.isArray(ldRoot)) {
-    // prendre le premier Vehicle ou Product qui contient un "offers"
-    ld = ldRoot.find((x) => x?.['@type'] === 'Vehicle' || x?.['@type'] === 'Product') || ldRoot[0]
-  }
-
-  if (!ld || typeof ld !== 'object') return {}
-
-  // Si c'est un ItemList -> pas une fiche, on renverra vide (géré ailleurs)
-  if (ld['@type'] === 'ItemList') return {}
-
-  const brand = (ld.brand?.name || ld.brand || '').toString() || undefined
-  const model = (ld.model || ld.modelDate || '').toString() || undefined
-  const version = (ld.name || ld.vehicleModelDate || '').toString() || undefined
-
-  const offers = ld.offers || {}
-  const price = getNum(offers.price)
-  const currency = (offers.priceCurrency || '').toString().toUpperCase() || undefined
-
-  const mileage = getNum(ld.mileageFromOdometer?.value ?? ld.mileage)
-  const firstRegistration = (ld.productionDate || ld.dateVehicleFirstRegistered || ld.releaseDate || undefined)?.toString()
-  const fuel = (ld.fuelType || '').toString() || undefined
-  const gearbox = (ld.vehicleTransmission || '').toString() || undefined
-  const powerHp = getNum(ld?.vehicleEngine?.enginePower?.value ?? ld?.vehicleEngine?.horsepower)
-  const color = (ld.color || '').toString() || undefined
-  const url = (ld.url || '').toString() || undefined
-  const vin = (ld.vehicleIdentificationNumber || ld.vin || '').toString() || undefined
-
-  let images: string[] | undefined
-  if (Array.isArray(ld.image)) images = ld.image.map(String)
-  else if (typeof ld.image === 'string') images = [ld.image]
-
-  return { brand, model, version, price, currency, mileage, firstRegistration, fuel, gearbox, powerHp, color, images, url, vin }
-}
-
-/* ----------------- Dealer inventory (garage page) --------------- */
-type InventoryPreview = { url: string; title?: string; price?: number; currency?: string }
-
-function scrapeAllLdJson(html: string): any[] {
-  const out: any[] = []
-  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-  let m: RegExpExecArray | null
-  while ((m = re.exec(html))) {
-    const raw = m[1]?.trim()
-    if (!raw) continue
-    const node = safeJsonParse<any>(raw)
-    if (node) out.push(node)
-  }
-  return out
-}
-
-// Remplacer intégralement cette fonction
-function fromItemList(ld: any): InventoryPreview[] {
-  const items: InventoryPreview[] = []
-  const list = Array.isArray(ld?.itemListElement) ? ld.itemListElement : []
-  for (const el of list) {
-    const item = el?.item || el
-    if (!item) continue
-
-    const url = (item.url || el.url || '').toString()
-    if (!url) continue
-
-    const title = (item.name || el.name || '').toString() || undefined
-    const price = getNum(item?.offers?.price ?? el?.offers?.price)
-
-    // ⚠️ ICI: on ne mélange plus ?? et ||
-    const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
-    const currency = String(currencyRaw).toUpperCase() || undefined
-
-    items.push({ url, title, price, currency })
-  }
-  return items
-}
-
-
-function scrapeDealerInventory(html: string): InventoryPreview[] {
-  const out: InventoryPreview[] = []
-
-  // 1) via JSON-LD: ItemList
-  const lds = scrapeAllLdJson(html)
-  for (const ld of lds) {
-    if (ld?.['@type'] === 'ItemList') {
-      out.push(...fromItemList(ld))
-    }
-    if (Array.isArray(ld)) {
-      for (const sub of ld) {
-        if (sub?.['@type'] === 'ItemList') out.push(...fromItemList(sub))
-      }
-    }
-  }
-
-  // 2) fallback: liens /fr/d/... dans le HTML
-  const hrefRe = /href=["'](https?:\/\/www\.autoscout24\.ch\/[^"']*\/d\/[^"']+)["']/gi
-  const set = new Set<string>()
-  let m: RegExpExecArray | null
-  while ((m = hrefRe.exec(html))) {
-    const u = m[1]
-    if (!set.has(u)) {
-      set.add(u)
-      out.push({ url: u })
-    }
-  }
-
-  // 3) dédupe
-  const dedup = new Map<string, InventoryPreview>()
-  for (const it of out) {
-    const key = it.url
-    if (!dedup.has(key)) dedup.set(key, it)
-  }
-  return Array.from(dedup.values())
-}
-
-function guessDealer(html: string) {
-  // Cherche un JSON-LD Organization/AutoDealer
-  const lds = scrapeAllLdJson(html)
-  for (const ld of lds) {
-    const arr = Array.isArray(ld) ? ld : [ld]
-    for (const node of arr) {
-      const t = (node?.['@type'] || '').toString().toLowerCase()
-      if (t.includes('autodealer') || t.includes('organization')) {
-        const name = (node.name || '').toString() || undefined
-        const telephone = (node.telephone || '').toString() || undefined
-        const url = (node.url || '').toString() || undefined
-        const address = node.address ? pick(node.address, ['streetAddress','postalCode','addressLocality','addressRegion','addressCountry'] as any) : undefined
-        if (name || telephone || url) return { name, telephone, url, address }
-      }
-    }
-  }
-
-  // fallback meta og:site_name
-  const og = /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i.exec(html)
-  if (og?.[1]) return { name: og[1] }
-
-  // fallback titre <title>
-  const t = /<title[^>]*>([^<]+)<\/title>/i.exec(html)
-  if (t?.[1]) return { name: t[1] }
-
-  return {}
-}
-
 /* ----------------------------- routes --------------------------- */
 app.get('/health', (_req, res) => {
   res.json({ ok: true, status: qrStatus, connected: Boolean(sock?.user), user: sock?.user || null })
@@ -608,76 +273,354 @@ app.post('/session/reconnect', requireAuth, async (_req, res) => {
 })
 
 /* ----------------------- CARS RESOLVER ------------------------ */
-const RESOLVER_BEARER = process.env.RESOLVER_BEARER || ''
-
-function requireResolverAuth(req: Request, res: Response, next: NextFunction) {
-  const h = String(req.headers.authorization || '')
-  const t = h.startsWith('Bearer ') ? h.slice(7) : ''
-  if (!RESOLVER_BEARER) return res.status(500).json({ ok:false, error:'resolver bearer not set' })
-  if (t !== RESOLVER_BEARER) return res.status(401).json({ ok:false, error:'unauthorized' })
-  next()
-}
-
 // Santé
 app.get('/cars/health', (_req, res) => {
-  res.json({ ok: true, service: 'cars-resolver', ts: Date.now() })
+  res.json({ ok: true, service: 'cars-resolver', ts: Date.now(), proxy: !!CARS_PROXY_URL })
 })
+
+type CarNormalized = {
+  url?: string
+  title?: string
+  brand?: string
+  model?: string
+  version?: string
+  year?: number
+  mileage_km?: number
+  fuel?: string
+  gearbox?: string
+  body?: string
+  power_hp?: number
+  price?: number
+  currency?: string
+  images?: string[]
+  location?: string
+  seller?: { name?: string; type?: string }
+}
+
+type InventoryPreview = {
+  url: string
+  title?: string
+  price?: number
+  currency?: string
+}
 
 app.post('/cars/connect', requireResolverAuth, async (req, res) => {
   try {
-    const link = String(req.body?.link || '').trim()
+    const link = String(req.body?.link || '')
     if (!link) return res.status(400).json({ ok:false, error:'link required' })
 
-    // Fetch HTML avec anti-bot
-    const html = await smartGetHtml(link)
-
-    // 1) Tenter __NEXT_DATA__
-    const mNext = html.match(/<script id="__NEXT_DATA__"[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/)
-    if (mNext) {
-      const next = safeJsonParse<any>(mNext[1])
-      if (next) {
-        const carFromNext = extractCarFromNext(next)
-        const valid = Object.keys(carFromNext).length > 0
-        if (valid) {
-          return res.json({ ok:true, kind:'listing', source:'next', car: carFromNext })
-        }
-      }
+    const { ok, status, html, viaProxy } = await smartGetHtml(link)
+    if (!ok || !html) {
+      return res.status(502).json({ ok:false, error:'upstream_fetch_failed', details: status === 403 ? 'fetch_failed_403' : `status_${status}` })
     }
 
-    // 2) JSON-LD (Vehicle / Product)
-    const ldNodes = scrapeAllLdJson(html)
-    for (const node of ldNodes) {
-      const arr = Array.isArray(node) ? node : [node]
-      for (const ld of arr) {
-        const t = (ld?.['@type'] || '').toString().toLowerCase()
-        if (t === 'vehicle' || t === 'product') {
-          const car = mapLdToCar(ld)
-          const valid = car.brand || car.model || car.price
-          if (valid) return res.json({ ok:true, kind:'listing', source:'ld+json', car })
-        }
-      }
+    // 1) NEXT_DATA (Next.js)
+    const next = extractNextJSON(html)
+    if (next) {
+      const carFromNext = extractCarFromNext(next) // heuristique
+      if (carFromNext) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromNext })
+      const invFromNext = extractInventoryFromNext(next)
+      if (invFromNext?.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html, next), inventory_preview: invFromNext.slice(0, 20) })
     }
 
-    // 3) Garage: liste d’inventaire
-    const inventory = scrapeDealerInventory(html)
-    if (inventory?.length) {
-      return res.json({
-        ok:true,
-        kind:'garage',
-        dealer: guessDealer(html),
-        inventory_preview: inventory.slice(0, 10)
-      })
+    // 2) JSON-LD (peut être multiple)
+    const lds = extractAllJsonLd(html)
+    // chercher VEHICLE ou PRODUCT
+    const carFromLd = lds.map(mapLdToCar).find(Boolean)
+    if (carFromLd) return res.json({ ok:true, kind:'listing', viaProxy, car: carFromLd })
+
+    // 3) Inventory / ItemList
+    const invLD = lds.find(ld => isItemList(ld))
+    if (invLD) {
+      const dealer = guessDealer(html, undefined, invLD)
+      const preview = fromItemList(invLD)
+      if (preview.length) return res.json({ ok:true, kind:'garage', viaProxy, dealer, inventory_preview: preview.slice(0, 20) })
+    }
+
+    // 4) Fallback: heuristique de liens de fiches
+    const invFallback = scrapeDealerInventory(html, link)
+    if (invFallback.length) {
+      return res.json({ ok:true, kind:'garage', viaProxy, dealer: guessDealer(html), inventory_preview: invFallback.slice(0, 20) })
     }
 
     return res.status(422).json({ ok:false, error:'unrecognized_autoscout24_page' })
   } catch (e:any) {
-    const status = e?.status || 500
-    const code   = status === 403 ? 'blocked_by_anti_bot' : 'resolver_crash'
-    return res.status(status === 403 ? 502 : status).json({
-      ok:false, error: code, details: e?.message || String(e)
-    })
+    logger.error({ err: e?.message, stack: e?.stack }, 'cars_connect_crash')
+    res.status(500).json({ ok:false, error:'resolver_crash', details:e?.message })
   }
 })
+
+/* --------------------- fetch & parsing helpers ------------------ */
+async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string; viaProxy?: boolean }> {
+  const headers: Record<string,string> = {
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'accept-language': 'fr-CH,fr;q=0.9,en;q=0.8,de;q=0.7',
+    'cache-control': 'no-cache',
+    'pragma': 'no-cache',
+  }
+
+  try {
+    const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
+    if (r.status === 200) {
+      const html = await r.text()
+      return { ok: true, status: 200, html, viaProxy: false }
+    }
+    // 301/302 suivis automatiquement; si 403 → fallback proxy
+    if (r.status === 403 || r.status === 503) {
+      if (!CARS_PROXY_URL) return { ok:false, status: r.status }
+      // proxy simple: GET ?url=encoded
+      const pr = await fetch(`${CARS_PROXY_URL}?url=${encodeURIComponent(url)}`, { headers: { 'x-resolver-bearer': RESOLVER_BEARER } })
+      if (!pr.ok) return { ok:false, status: pr.status }
+      const ct = pr.headers.get('content-type') || ''
+      if (ct.includes('application/json')) {
+        const j = await pr.json()
+        const body = j?.body ?? j?.html ?? ''
+        if (typeof body === 'string' && body.length) return { ok:true, status: 200, html: body, viaProxy: true }
+        return { ok:false, status: 502 }
+      } else {
+        const body = await pr.text()
+        if (body) return { ok:true, status: 200, html: body, viaProxy: true }
+        return { ok:false, status: 502 }
+      }
+    }
+    // autres codes
+    const txt = await r.text().catch(() => '')
+    logger.warn({ status: r.status, len: txt?.length }, 'smartGetHtml_non200')
+    return { ok:false, status: r.status }
+  } catch (e:any) {
+    logger.error({ err: e?.message }, 'smartGetHtml_error')
+    return { ok:false, status: 599 }
+  }
+}
+
+function extractNextJSON(html: string): any | null {
+  const re = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/
+  const m = html.match(re)
+  if (!m) return null
+  try {
+    return JSON.parse(m[1])
+  } catch { return null }
+}
+
+function extractAllJsonLd(html: string): any[] {
+  const out: any[] = []
+  const re = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null) {
+    const raw = m[1]
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) out.push(...parsed)
+      else out.push(parsed)
+    } catch {
+      // rien
+    }
+  }
+  return out
+}
+
+function isItemList(ld: any): boolean {
+  const t = (ld?.['@type'] || '').toString().toLowerCase()
+  return t === 'itemlist'
+}
+
+function deepPick(obj: any, keys: string[]): any {
+  // Cherche la première clé dispo (profondeur limitée)
+  if (!obj || typeof obj !== 'object') return undefined
+  for (const k of keys) {
+    if (obj && typeof obj === 'object' && k in obj) return (obj as any)[k]
+  }
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') {
+      const r = deepPick(v, keys)
+      if (r !== undefined) return r
+    }
+  }
+  return undefined
+}
+
+function getNum(val: any): number | undefined {
+  if (val === null || val === undefined) return undefined
+  const s = String(val).replace(/\s/g, '')
+  const m = s.match(/-?\d+(?:[.,]\d+)?/)
+  if (!m) return undefined
+  const n = Number(m[0].replace(',', '.'))
+  return isNaN(n) ? undefined : n
+}
+
+function toInt(val: any): number | undefined {
+  const n = getNum(val)
+  return n !== undefined ? Math.round(n) : undefined
+}
+
+function upperOrUndef(s: any): string | undefined {
+  const v = (s ?? '').toString().trim()
+  return v ? v.toUpperCase() : undefined
+}
+
+/* --------------------- mapping: JSON-LD → Car ------------------- */
+function mapLdToCar(ld: any): CarNormalized | null {
+  if (!ld || typeof ld !== 'object') return null
+  const type = (ld['@type'] || '').toString().toLowerCase()
+  if (!['vehicle', 'product', 'car'].includes(type)) return null
+
+  const brand = ld.brand?.name || ld.brand
+  const model = ld.model || ld.vehicleModel || ld.name
+  const year  = toInt(ld.modelDate || ld.vehicleModelDate || ld.productionDate || ld.releaseDate)
+
+  // price
+  let price = getNum(ld.offers?.price)
+  let currency = upperOrUndef(ld.offers?.priceCurrency)
+
+  // mileage
+  const mObj = ld.mileageFromOdometer
+  const mileage_km = mObj?.value ? toInt(mObj.value) : toInt(ld.mileage || ld.mileageFromOdometer)
+
+  const fuel = ld.fuelType || ld.fuel || undefined
+  const gearbox = ld.vehicleTransmission || ld.transmission || undefined
+  const power_hp = toInt(ld.power) || toInt(ld.enginePower?.value)
+  const images = Array.isArray(ld.image) ? ld.image : (ld.image ? [ld.image] : undefined)
+
+  const sellerName = ld.seller?.name || ld.brand?.name
+  const sellerType = ld.seller?.['@type']
+
+  const title = ld.name || [brand, model, year].filter(Boolean).join(' ')
+  const url = ld.url
+
+  if (!brand && !model && !price && !year && !images?.length) {
+    // trop faible → considérer non pertinent
+    return null
+  }
+
+  return {
+    url, title,
+    brand, model,
+    version: undefined,
+    year: year,
+    mileage_km,
+    fuel: fuel?.toString(),
+    gearbox: gearbox?.toString(),
+    body: ld.bodyType || undefined,
+    power_hp,
+    price,
+    currency,
+    images,
+    location: ld.offers?.availableAtOrFrom?.address?.addressLocality,
+    seller: (sellerName || sellerType) ? { name: sellerName, type: sellerType } : undefined,
+  }
+}
+
+/* -------------- mapping: ItemList(JSON-LD) → inventory --------- */
+function fromItemList(ld: any): InventoryPreview[] {
+  const items: InventoryPreview[] = []
+  const list = Array.isArray(ld?.itemListElement) ? ld.itemListElement : []
+  for (const el of list) {
+    const item = el?.item || el
+    if (!item) continue
+
+    const url = (item.url || el.url || '').toString()
+    if (!url) continue
+
+    const title = (item.name || el.name || '').toString() || undefined
+    const price = getNum(item?.offers?.price ?? el?.offers?.price)
+
+    // Ne pas mélanger ?? et || sans parenthèses (TS5076)
+    const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
+    const currency = String(currencyRaw).toUpperCase() || undefined
+
+    items.push({ url, title, price, currency })
+  }
+  return items
+}
+
+/* --------------------- NEXT_DATA → Car / Inventory ------------- */
+function extractCarFromNext(next: any): CarNormalized | null {
+  if (!next || typeof next !== 'object') return null
+  // Heuristique : chercher un objet "listing"/"ad"/"vehicle" avec marque, modèle, prix
+  const candidate = deepPick(next, ['listing', 'ad', 'vehicle', 'car', 'detail'])
+  if (!candidate || typeof candidate !== 'object') return null
+
+  const brand = candidate.brand?.name || candidate.brand || candidate.makeName || candidate.make
+  const model = candidate.modelName || candidate.model || candidate.type
+  const year  = toInt(candidate.firstRegistrationYear || candidate.year || candidate.registrationYear)
+  const mileage_km = toInt(candidate.mileage || candidate.mileageKm || candidate.odometer)
+  const price = getNum(candidate.price?.amount ?? candidate.price ?? candidate.priceValue)
+  const currency = upperOrUndef(candidate.price?.currency ?? candidate.currency)
+  const title = candidate.title || [brand, model, year].filter(Boolean).join(' ')
+  const images = Array.isArray(candidate.images)
+    ? candidate.images.map((i:any) => i?.url || i).filter(Boolean)
+    : undefined
+
+  if (!brand && !model && !price && !year && !images?.length) return null
+
+  return {
+    title,
+    brand: brand?.toString(),
+    model: model?.toString(),
+    year,
+    mileage_km,
+    price,
+    currency,
+    images,
+    fuel: candidate.fuelType || candidate.fuel,
+    gearbox: candidate.transmission,
+    power_hp: toInt(candidate.powerHp || candidate.power),
+    url: candidate.canonicalUrl || candidate.url,
+    seller: candidate.seller ? { name: candidate.seller?.name, type: candidate.seller?.type } : undefined,
+  }
+}
+
+function extractInventoryFromNext(next: any): InventoryPreview[] {
+  // Cherche une liste d’items avec url + name + price
+  const arr: any = deepPick(next, ['inventory', 'list', 'results', 'items', 'cars'])
+  const list = Array.isArray(arr) ? arr : []
+  const out: InventoryPreview[] = []
+  for (const it of list) {
+    const url = (it?.url || it?.canonicalUrl || '').toString()
+    if (!url) continue
+    const title = (it?.title || it?.name || '').toString() || undefined
+    const price = getNum(it?.price?.amount ?? it?.price)
+    const currency = upperOrUndef(it?.price?.currency ?? it?.currency)
+    out.push({ url, title, price, currency })
+  }
+  return out
+}
+
+/* ------------------ Fallback dealer inventory ------------------ */
+function scrapeDealerInventory(html: string, base?: string): InventoryPreview[] {
+  const out: InventoryPreview[] = []
+  const linkRe = /href="([^"]+)"/g
+  let m: RegExpExecArray | null
+  const seen = new Set<string>()
+  while ((m = linkRe.exec(html)) !== null) {
+    let href = m[1]
+    if (href.startsWith('/')) {
+      try {
+        const u = new URL(base || 'https://www.autoscout24.ch')
+        href = `${u.origin}${href}`
+      } catch {}
+    }
+    if (!/^https?:\/\//i.test(href)) continue
+    // heuristique: fiches autoscout contiennent "/d/" (detail)
+    if (!/autoscout24\.[a-z.]+\/.+\/d\//i.test(href)) continue
+    if (seen.has(href)) continue
+    seen.add(href)
+    out.push({ url: href })
+    if (out.length >= 100) break
+  }
+  return out
+}
+
+function guessDealer(html: string, next?: any, ld?: any): { name?: string } | undefined {
+  const metaName = (html.match(/<meta property="og:site_name" content="([^"]+)"/)?.[1]) ||
+                   (html.match(/<meta property="og:title" content="([^"]+)"/)?.[1]) ||
+                   (html.match(/<title>([^<]+)<\/title>/)?.[1])
+  const ldOrg = (ld && (ld['@type'] === 'AutoDealer' || ld['@type'] === 'Organization')) ? (ld?.name || ld?.legalName) : undefined
+  const nextSeller = next ? deepPick(next, ['seller','dealer','store']) : undefined
+  const name = nextSeller?.name || ldOrg || metaName
+  return name ? { name } : undefined
+}
 
 /* --------- sending: text / image / audio / PTT / reaction ------ */
 app.post('/send-text', requireAuth, async (req, res) => {
