@@ -144,6 +144,12 @@ async function hardResetAndRestart() {
 }
 
 /** ====== ROUTES ====== */
+// ✅ Health endpoints + root
+app.get('/', (_req, res) => res.json({ ok: true, status: 'up', health: ['/health','/healthz'] }));
+app.get('/health', (_req, res) => res.json({ ok: true, status: 'up' }));
+app.head('/health', (_req, res) => res.status(200).end());
+app.get('/healthz', (_req, res) => res.json({ ok: true, status: 'up' }));
+app.head('/healthz', (_req, res) => res.status(200).end());
 
 // Health
 app.get('/healthz', (_req, res) => res.json({ ok: true, status: lastStatus }));
