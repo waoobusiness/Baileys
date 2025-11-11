@@ -473,21 +473,29 @@ function scrapeAllLdJson(html: string): any[] {
   return out
 }
 
+// Remplacer intégralement cette fonction
 function fromItemList(ld: any): InventoryPreview[] {
   const items: InventoryPreview[] = []
   const list = Array.isArray(ld?.itemListElement) ? ld.itemListElement : []
   for (const el of list) {
     const item = el?.item || el
     if (!item) continue
+
     const url = (item.url || el.url || '').toString()
     if (!url) continue
+
     const title = (item.name || el.name || '').toString() || undefined
     const price = getNum(item?.offers?.price ?? el?.offers?.price)
-    const currency = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency || '').toString().toUpperCase() || undefined
+
+    // ⚠️ ICI: on ne mélange plus ?? et ||
+    const currencyRaw = (item?.offers?.priceCurrency ?? el?.offers?.priceCurrency ?? '')
+    const currency = String(currencyRaw).toUpperCase() || undefined
+
     items.push({ url, title, price, currency })
   }
   return items
 }
+
 
 function scrapeDealerInventory(html: string): InventoryPreview[] {
   const out: InventoryPreview[] = []
