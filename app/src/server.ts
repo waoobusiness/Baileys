@@ -362,7 +362,45 @@ app.post('/cars/connect', requireResolverAuth, async (req, res) => {
 })
 
 /* --------------------- fetch & parsing helpers ------------------ */
-async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string; viaProxy?: boolean }> {
+function isAutoScout(url: string) {
+  try {
+    const u = new URL(url)
+    return /autoscout24\./i.test(u.hostname)
+  } catch { return false }
+}
+
+async function fetchViaProxy(targetUrl: string): Promise<{ ok: boolean; html?: string; status?: number }> {
+  if (!CARS_PROXY_URL) {
+    logger.warn({ CARS_PROXY_URL }, 'proxy_not_configured')
+    return { ok: false, status: 500 }
+  }
+  const proxyUrl = `${CARS_PROXY_URL}?url=${encodeURIComponent(targetUrl)}`
+  logger.info({ proxyUrl: CARS_PROXY_URL, target: targetUrl }, 'using_proxy')
+
+  const r = await fetch(proxyUrl, {
+    headers: {
+      'x-resolver-bearer': RESOLVER_BEARER,
+      'authorization': `Bearer ${RESOLVER_BEARER}`,
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
+      'accept-language': 'fr-CH,fr;q=0.9,en;q=0.8,de;q=0.7',
+      'cache-control': 'no-cache',
+    }
+  })
+
+  const ct = r.headers.get('content-type') || ''
+  const body = ct.includes('application/json') ? await r.json().catch(() => ({})) : await r.text()
+  if (!r.ok) {
+    logger.warn({ status: r.status, bodyLen: typeof body === 'string' ? body.length : JSON.stringify(body).length }, 'proxy_non200')
+    return { ok: false, status: r.status }
+  }
+
+  if (typeof body === 'string') return { ok: true, html: body, status: 200 }
+  const html = body?.body ?? body?.html ?? ''
+  if (typeof html !== 'string' || !html) return { ok: false, status: 502 }
+  return { ok: true, html, status: 200 }
+}
+
+async function directFetchHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string }> {
   const headers: Record<string,string> = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36',
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -370,99 +408,39 @@ async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number
     'cache-control': 'no-cache',
     'pragma': 'no-cache',
   }
+  const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
+  const html = await r.text().catch(() => '')
+  return { ok: r.status === 200, status: r.status, html }
+}
 
-  try {
-    const r = await fetch(url, { headers, redirect: 'follow' as RequestRedirect })
-    if (r.status === 200) {
-      const html = await r.text()
-      return { ok: true, status: 200, html, viaProxy: false }
-    }
-    if (r.status === 403 || r.status === 503) {
-      if (!CARS_PROXY_URL) return { ok:false, status: r.status }
-      const pr = await fetch(`${CARS_PROXY_URL}?url=${encodeURIComponent(url)}`, {
-        headers: { 'x-resolver-bearer': RESOLVER_BEARER }
-      })
-      if (!pr.ok) return { ok:false, status: pr.status }
-      const ct = pr.headers.get('content-type') || ''
-      if (ct.includes('application/json')) {
-        const j = await pr.json()
-        const body = j?.body ?? j?.html ?? ''
-        if (typeof body === 'string' && body.length) return { ok:true, status: 200, html: body, viaProxy: true }
-        return { ok:false, status: 502 }
-      } else {
-        const body = await pr.text()
-        if (body) return { ok:true, status: 200, html: body, viaProxy: true }
-        return { ok:false, status: 502 }
-      }
-    }
-    const txt = await r.text().catch(() => '')
-    logger.warn({ status: r.status, len: txt?.length }, 'smartGetHtml_non200')
-    return { ok:false, status: r.status }
-  } catch (e:any) {
-    logger.error({ err: e?.message }, 'smartGetHtml_error')
-    return { ok:false, status: 599 }
+async function smartGetHtml(url: string): Promise<{ ok: boolean; status?: number; html?: string; viaProxy?: boolean }> {
+  const forceProxy = (process.env.ALWAYS_PROXY_AUTOSCOUT || '').toLowerCase() === 'true'
+  const targetIsAutoscout = isAutoScout(url)
+
+  // 1) Force proxy si demandé ou si domaine autoscout
+  if (forceProxy || targetIsAutoscout) {
+    const pr = await fetchViaProxy(url)
+    if (pr.ok && pr.html) return { ok: true, status: 200, html: pr.html, viaProxy: true }
+    // si proxy échoue, on tente direct (rarement utile mais sain)
+    const dr = await directFetchHtml(url)
+    if (dr.ok && dr.html) return { ok: true, status: 200, html: dr.html, viaProxy: false }
+    return { ok: false, status: pr.status ?? dr.status ?? 502 }
   }
-}
 
-function extractNextJSON(html: string): any | null {
-  const re = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/
-  const m = html.match(re)
-  if (!m) return null
-  try { return JSON.parse(m[1]) } catch { return null }
-}
+  // 2) Sinon, d’abord direct, puis proxy si 403/503
+  const dr = await directFetchHtml(url)
+  if (dr.ok && dr.html) return { ok: true, status: 200, html: dr.html, viaProxy: false }
 
-function extractAllJsonLd(html: string): any[] {
-  const out: any[] = []
-  const re = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(html)) !== null) {
-    const raw = m[1]
-    try {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) out.push(...parsed)
-      else out.push(parsed)
-    } catch {}
+  if (dr.status === 403 || dr.status === 503) {
+    const pr = await fetchViaProxy(url)
+    if (pr.ok && pr.html) return { ok: true, status: 200, html: pr.html, viaProxy: true }
+    return { ok: false, status: pr.status ?? dr.status }
   }
-  return out
+
+  logger.warn({ status: dr.status }, 'smartGetHtml_non200')
+  return { ok: false, status: dr.status }
 }
 
-function isItemList(ld: any): boolean {
-  const t = (ld?.['@type'] || '').toString().toLowerCase()
-  return t === 'itemlist'
-}
-
-function deepPick(obj: any, keys: string[]): any {
-  if (!obj || typeof obj !== 'object') return undefined
-  for (const k of keys) {
-    if (obj && typeof obj === 'object' && k in obj) return (obj as any)[k]
-  }
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') {
-      const r = deepPick(v, keys)
-      if (r !== undefined) return r
-    }
-  }
-  return undefined
-}
-
-function getNum(val: any): number | undefined {
-  if (val === null || val === undefined) return undefined
-  const s = String(val).replace(/\s/g, '')
-  const m = s.match(/-?\d+(?:[.,]\d+)?/)
-  if (!m) return undefined
-  const n = Number(m[0].replace(',', '.'))
-  return isNaN(n) ? undefined : n
-}
-
-function toInt(val: any): number | undefined {
-  const n = getNum(val)
-  return n !== undefined ? Math.round(n) : undefined
-}
-
-function upperOrUndef(s: any): string | undefined {
-  const v = (s ?? '').toString().trim()
-  return v ? v.toUpperCase() : undefined
-}
 
 /* --------------------- mapping: JSON-LD → Car ------------------- */
 function mapLdToCar(ld: any): CarNormalized | null {
