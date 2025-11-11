@@ -1,6 +1,7 @@
 // src/server.ts
 import 'dotenv/config'
 import express, { Request, Response, NextFunction } from 'express'
+import carsConnectRouter, { carsConnectParsers } from "./cars-connect";
 import cors from 'cors'
 import pino from 'pino'
 import { Boom } from '@hapi/boom'
@@ -19,6 +20,8 @@ import path from 'path'
 /* ------------------------- logger & app ------------------------- */
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
 const app = express()
+app.use(carsConnectParsers);
+app.use("/cars", carsConnectRouter);
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
