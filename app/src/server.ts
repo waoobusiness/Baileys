@@ -14,40 +14,38 @@ import makeWASocket, {
   AnyMessageContent
 } from '@whiskeysockets/baileys';
 
-/**
- * =========================
+/* =========================
  * Config & helpers
- * =========================
- */
+ * ========================= */
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const AUTH_BASE = process.env.AUTH_BASE || path.resolve(process.cwd(), 'data');
 const AUTH_DISABLED = String(process.env.AUTH_DISABLED || '').trim() === '1';
 
+const logger = pino({ level: process.env.LOG_LEVEL || 'info', base: undefined });
+
 function normToken(s: string) {
-  return s.trim().replace(/^['"]|['"]$/g, ''); // enlève guillemets collés par erreur
+  return String(s || '').trim().replace(/^['"]|['"]$/g, '');
 }
 function parseTokensFromEnv(): string[] {
-  const raw = (process.env.AUTH_TOKENS || process.env.AUTH_TOKEN || '')
-    .split(',')
-    .map(normToken)
-    .filter(Boolean);
-  return Array.from(new Set(raw)); // uniq
+  const list =
+    (process.env.AUTH_TOKENS || process.env.AUTH_TOKEN || '')
+      .split(',')
+      .map(normToken)
+      .filter(Boolean);
+  return Array.from(new Set(list));
 }
 const TOKENS = parseTokensFromEnv();
 
-function fp(s: string) {
-  const t = normToken(s);
-  if (!t) return { len: 0, head: '', tail: '' };
+function fp(token: string) {
+  const t = normToken(token);
   return { len: t.length, head: t.slice(0, 4), tail: t.slice(-4) };
 }
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info', base: undefined });
-
-// Auth — accepte Authorization: Bearer <token> OU X-Api-Key: <token>
+// Accept Authorization: Bearer <token> OR X-Api-Key: <token>
 function assertAuth(req: express.Request, res: express.Response): boolean {
-  if (AUTH_DISABLED) return true; // mode test sans auth
+  if (AUTH_DISABLED) return true;
   if (!TOKENS.length) {
     logger.warn({ path: req.path }, 'auth required but no tokens configured');
     res.status(403).json({ ok: false, error: 'forbidden' });
@@ -59,24 +57,20 @@ function assertAuth(req: express.Request, res: express.Response): boolean {
   const candidate = normToken(fromBearer || fromApiKey);
   const ok = !!candidate && TOKENS.includes(candidate);
   if (!ok) {
-    logger.warn({
-      path: req.path,
-      method: req.method,
-      bearer: fp(fromBearer),
-      apiKey: fp(fromApiKey),
-      tokensConfigured: TOKENS.length
-    }, 'auth failed');
+    logger.warn(
+      {
+        path: req.path,
+        method: req.method,
+        bearer: fp(fromBearer),
+        apiKey: fp(fromApiKey),
+        tokensConfigured: TOKENS.length
+      },
+      'auth failed'
+    );
     res.status(403).json({ ok: false, error: 'forbidden' });
     return false;
   }
   return true;
-}
-
-function parsePhoneFromJid(jid?: string | null): string | null {
-  if (!jid) return null;
-  const local = jid.split('@')[0].split(':')[0];
-  if (!/^\d+$/.test(local)) return null;
-  return `+${local}`;
 }
 
 async function ensureDir(p: string) {
@@ -92,19 +86,30 @@ function jidFromPhoneOrJid(input: string): string {
   const digits = s.replace(/\D/g, '');
   return `${digits}@s.whatsapp.net`;
 }
+function phoneFromJid(jid?: string | null): string | null {
+  if (!jid) return null;
+  const local = jid.split('@')[0].split(':')[0];
+  if (!/^\d+$/.test(local)) return null;
+  return `+${local}`;
+}
 
 function sseWrite(res: express.Response, event: string, data: unknown) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-/**
- * =========================
+/* =========================
  * Session registry
- * =========================
- */
+ * ========================= */
 
-type SessionStatus = 'pending' | 'qr' | 'connected' | 'disconnected' | 'closed' | 'error' | 'connecting';
+type SessionStatus =
+  | 'pending'
+  | 'qr'
+  | 'connected'
+  | 'disconnected'
+  | 'closed'
+  | 'error'
+  | 'connecting';
 
 type Session = {
   id: string;
@@ -118,33 +123,34 @@ type Session = {
   webhookSecret?: string;
   jid?: string | null;
   phone?: string | null;
+  restarting?: boolean; // guard auto-reconnect
 };
 
 const sessions = new Map<string, Session>();
 
-function getOrCreateSession(sessionId: string): Session {
-  let s = sessions.get(sessionId);
+function getOrCreateSession(id: string): Session {
+  let s = sessions.get(id);
   if (!s) {
     s = {
-      id: sessionId,
+      id,
       status: 'pending',
-      authDir: path.join(AUTH_BASE, 'sessions', sessionId),
+      authDir: path.join(AUTH_BASE, 'sessions', id),
       sseClients: new Set<express.Response>(),
       qrText: null,
       qrDataURL: null,
       jid: null,
-      phone: null
+      phone: null,
+      restarting: false
     };
-    sessions.set(sessionId, s);
+    sessions.set(id, s);
   }
   return s;
 }
 
-/**
- * =========================
- * Webhook notifier
- * =========================
- */
+/* =========================
+ * Webhook notify
+ * ========================= */
+
 async function notifyWebhook(
   s: Session,
   event: string,
@@ -155,49 +161,48 @@ async function notifyWebhook(
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (s.webhookSecret) headers['x-webhook-secret'] = s.webhookSecret;
 
-    const body = {
-      event,
-      session_id: s.id,
-      status: s.status,
-      jid: s.jid ?? null,
-      phone: s.phone ?? null,
-      payload
-    };
-
     await fetch(s.webhookUrl, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        event,
+        session_id: s.id,
+        status: s.status,
+        jid: s.jid ?? null,
+        phone: s.phone ?? null,
+        payload
+      })
     });
   } catch (e) {
     logger.warn({ err: String(e), session: s.id }, 'notifyWebhook failed');
   }
 }
 
-/**
- * =========================
+/* =========================
  * Baileys wiring
- * =========================
- */
+ * ========================= */
+
 async function startSock(sessionId: string) {
   const s = getOrCreateSession(sessionId);
+
   s.status = 'connecting';
+  for (const res of s.sseClients) sseWrite(res, 'status', { status: s.status });
 
   await ensureDir(s.authDir);
+
   const { state, saveCreds } = await useMultiFileAuthState(s.authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false,
     auth: state,
+    printQRInTerminal: false,
     browser: ['Zuria.AI', 'Chrome', '121'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000
   });
-
   s.sock = sock;
 
   sock.ev.on('creds.update', saveCreds);
@@ -205,62 +210,82 @@ async function startSock(sessionId: string) {
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
 
+    // QR received
     if (qr) {
-  s.qrText = qr;
-  try { s.qrDataURL = await QRCode.toDataURL(qr); }
-  catch { s.qrDataURL = null; }
+      s.qrText = qr;
+      try {
+        s.qrDataURL = await QRCode.toDataURL(qr);
+      } catch {
+        s.qrDataURL = null;
+      }
+      s.status = 'qr';
+      // alias `qrData` for front compatibility
+      const payload = { qrText: s.qrText, qrDataURL: s.qrDataURL, qrData: s.qrDataURL };
+      for (const res of s.sseClients) sseWrite(res, 'qr', payload);
+      await notifyWebhook(s, 'session.status', { status: s.status, hasQR: true });
+    }
 
-  s.status = 'qr';
-
-  const payload = {
-    qrText: s.qrText,
-    qrDataURL: s.qrDataURL,
-    qrData: s.qrDataURL // 👈 alias pour compat avec front qui lit "qrData"
-  };
-
-  for (const res of s.sseClients) sseWrite(res, 'qr', payload);
-  await notifyWebhook(s, 'session.status', { status: s.status, hasQR: true });
-}
-
+    // Connected
     if (connection === 'open') {
       s.status = 'connected';
       s.jid = sock.user?.id || null;
-      s.phone = parsePhoneFromJid(s.jid);
+      s.phone = phoneFromJid(s.jid);
       for (const res of s.sseClients) sseWrite(res, 'connected', { jid: s.jid, phone: s.phone });
       await notifyWebhook(s, 'session.status', { status: s.status, jid: s.jid, phone: s.phone });
     }
 
+    // Closed / restart logic
     if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-      if (statusCode === DisconnectReason.loggedOut) {
+      const code = (lastDisconnect as any)?.error?.output?.statusCode;
+
+      if (code === DisconnectReason.loggedOut) {
+        // hard close, wipe credentials
         s.status = 'closed';
         for (const res of s.sseClients) sseWrite(res, 'closed', { reason: 'logged_out' });
-      } else {
-        s.status = 'disconnected';
-        for (const res of s.sseClients) sseWrite(res, 'disconnected', { reason: 'connection_closed' });
+        await notifyWebhook(s, 'session.status', { status: s.status, reason: 'logged_out' });
+        return;
       }
-      await notifyWebhook(s, 'session.status', { status: s.status });
+
+      // restart required (e.g., code 515) or transient close
+      if (!s.restarting) {
+        s.restarting = true;
+        s.status = 'connecting';
+        for (const res of s.sseClients) sseWrite(res, 'status', { status: s.status, reason: 'reconnect' });
+        await notifyWebhook(s, 'session.status', { status: s.status, reason: 'reconnect', code });
+
+        setTimeout(async () => {
+          try {
+            await startSock(s.id);
+          } catch (e) {
+            s.status = 'error';
+            for (const res of s.sseClients) sseWrite(res, 'status', { status: s.status, error: String(e) });
+            await notifyWebhook(s, 'session.status', { status: s.status, error: String(e) });
+          } finally {
+            s.restarting = false;
+          }
+        }, 1500);
+      }
     }
   });
 
+  // Messages
   sock.ev.on('messages.upsert', async (ev) => {
     const msg = ev.messages?.[0];
     if (!msg) return;
     const from = msg.key.remoteJid || '';
-    const message: AnyMessageContent | undefined = (msg as any).message;
+    const m: any = (msg as any).message;
 
     const content = {
-      text: (message as any)?.conversation || (message as any)?.extendedTextMessage?.text || null,
-      audio: !!(message as any)?.audioMessage,
-      image: !!(message as any)?.imageMessage,
-      video: !!(message as any)?.videoMessage,
-      document: !!(message as any)?.documentMessage
+      text: m?.conversation || m?.extendedTextMessage?.text || null,
+      audio: !!m?.audioMessage,
+      image: !!m?.imageMessage,
+      video: !!m?.videoMessage,
+      document: !!m?.documentMessage
     };
 
     await notifyWebhook(s, 'message.incoming', {
       from,
-      message: content,
-      raw: undefined // on n’envoie pas le raw pour alléger
+      message: content
     });
   });
 
@@ -288,11 +313,10 @@ async function sendText(sessionId: string, to: string, text: string) {
   await s.sock.sendMessage(jidFromPhoneOrJid(to), { text });
 }
 
-/**
- * =========================
- * HTTP App
- * =========================
- */
+/* =========================
+ * HTTP app
+ * ========================= */
+
 const app = express();
 app.disable('x-powered-by');
 app.use(cors());
@@ -303,14 +327,18 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'zuria-wa-gateway',
-    version: '1.0.2',
+    version: '1.1.0',
     auth_required: !AUTH_DISABLED && TOKENS.length > 0,
     tokensConfigured: TOKENS.length,
-    sessions: [...sessions.values()].map(s => ({ id: s.id, status: s.status }))
+    sessions: [...sessions.values()].map((s) => ({
+      id: s.id,
+      status: s.status,
+      phone: s.phone ?? null
+    }))
   });
 });
 
-// Start (idempotent)
+// Start / idempotent
 app.post('/sessions/:id/start', async (req, res) => {
   if (!assertAuth(req, res)) return;
   const id = String(req.params.id);
@@ -320,7 +348,7 @@ app.post('/sessions/:id/start', async (req, res) => {
     if (webhookUrl) s.webhookUrl = String(webhookUrl);
     if (webhookSecret) s.webhookSecret = String(webhookSecret);
 
-    if (!s.sock || s.status === 'closed' || s.status === 'error' || s.status === 'disconnected') {
+    if (!s.sock || ['closed', 'error', 'disconnected'].includes(s.status)) {
       await startSock(id);
     }
     res.json({ ok: true, id, status: s.status, webhookUrl: s.webhookUrl ?? null });
@@ -330,7 +358,7 @@ app.post('/sessions/:id/start', async (req, res) => {
   }
 });
 
-// Reset (wipe auth + restart)
+// Reset (wipe + restart)
 app.post('/sessions/:id/reset', async (req, res) => {
   if (!assertAuth(req, res)) return;
   const id = String(req.params.id);
@@ -358,20 +386,21 @@ app.get('/sessions/:id/status', (req, res) => {
   });
 });
 
-// SSE events (qr/connected/status)
+// SSE to clients (UI)
 app.get('/events/:id', (req, res) => {
   if (!assertAuth(req, res)) return;
   const id = String(req.params.id);
   const s = getOrCreateSession(id);
 
-  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
 
-  // push état actuel
+  // push current state immediately
   sseWrite(res, 'status', { status: s.status, jid: s.jid ?? null, phone: s.phone ?? null });
   if (s.status === 'qr' && s.qrText) {
-    sseWrite(res, 'qr', { qrText: s.qrText, qrDataURL: s.qrDataURL });
+    sseWrite(res, 'qr', { qrText: s.qrText, qrDataURL: s.qrDataURL, qrData: s.qrDataURL });
   }
   if (s.status === 'connected') {
     sseWrite(res, 'connected', { jid: s.jid ?? null, phone: s.phone ?? null });
@@ -395,20 +424,22 @@ app.post('/sessions/:id/send-text', async (req, res) => {
   }
 });
 
-/**
- * =========================
+/* =========================
  * Boot
- * =========================
- */
+ * ========================= */
+
 (async () => {
   await ensureDir(path.join(AUTH_BASE, 'sessions'));
-  logger.info({
-    PORT,
-    HOST,
-    AUTH_BASE,
-    auth_required: !AUTH_DISABLED && TOKENS.length > 0,
-    tokensConfigured: TOKENS.length
-  }, 'Zuria.AI Baileys Multi-session Gateway up');
+  logger.info(
+    {
+      PORT,
+      HOST,
+      AUTH_BASE,
+      auth_required: !AUTH_DISABLED && TOKENS.length > 0,
+      tokensConfigured: TOKENS.length
+    },
+    'Zuria.AI Baileys Multi-session Gateway up'
+  );
   const appInstance = app.listen(PORT, HOST);
   appInstance.setTimeout?.(120000);
 })();
