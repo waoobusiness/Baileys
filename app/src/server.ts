@@ -26,48 +26,44 @@ const AUTH_BASE = process.env.AUTH_BASE || path.resolve(process.cwd(), 'data');
 const AUTH_DISABLED = String(process.env.AUTH_DISABLED || '').trim() === '1';
 
 function normToken(s: string) {
-  return s.trim().replace(/^['"]|['"]$/g, ''); // retire guillemets collés par erreur
+  return s.trim().replace(/^['"]|['"]$/g, ''); // enlève guillemets collés par erreur
 }
 function parseTokensFromEnv(): string[] {
   const raw = (process.env.AUTH_TOKENS || process.env.AUTH_TOKEN || '')
     .split(',')
     .map(normToken)
     .filter(Boolean);
-  // remove duplicates
-  return Array.from(new Set(raw));
+  return Array.from(new Set(raw)); // uniq
 }
 const TOKENS = parseTokensFromEnv();
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info', base: undefined });
-
-function tokenMatches(provided: string) {
-  const t = normToken(provided);
-  return t && TOKENS.includes(t);
+function fp(s: string) {
+  const t = normToken(s);
+  if (!t) return { len: 0, head: '', tail: '' };
+  return { len: t.length, head: t.slice(0, 4), tail: t.slice(-4) };
 }
 
-// Auth middleware – accepte Authorization: Bearer <token> OU X-Api-Key: <token>
-function assertAuth(req: express.Request, res: express.Response): boolean {
-  if (AUTH_DISABLED) return true; // pour test rapide
+const logger = pino({ level: process.env.LOG_LEVEL || 'info', base: undefined });
 
+// Auth — accepte Authorization: Bearer <token> OU X-Api-Key: <token>
+function assertAuth(req: express.Request, res: express.Response): boolean {
+  if (AUTH_DISABLED) return true; // mode test sans auth
   if (!TOKENS.length) {
     logger.warn({ path: req.path }, 'auth required but no tokens configured');
     res.status(403).json({ ok: false, error: 'forbidden' });
     return false;
   }
-
   const auth = (req.header('authorization') || '').trim();
   const fromBearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
   const fromApiKey = (req.header('x-api-key') || '').trim();
-
-  const candidate = fromBearer || fromApiKey;
-  const ok = tokenMatches(candidate);
-
+  const candidate = normToken(fromBearer || fromApiKey);
+  const ok = !!candidate && TOKENS.includes(candidate);
   if (!ok) {
     logger.warn({
       path: req.path,
       method: req.method,
-      bearerLen: fromBearer.length,
-      apiKeyLen: fromApiKey.length,
+      bearer: fp(fromBearer),
+      apiKey: fp(fromApiKey),
       tokensConfigured: TOKENS.length
     }, 'auth failed');
     res.status(403).json({ ok: false, error: 'forbidden' });
@@ -107,6 +103,7 @@ function sseWrite(res: express.Response, event: string, data: unknown) {
  * Session registry
  * =========================
  */
+
 type SessionStatus = 'pending' | 'qr' | 'connected' | 'disconnected' | 'closed' | 'error' | 'connecting';
 
 type Session = {
@@ -210,11 +207,8 @@ async function startSock(sessionId: string) {
 
     if (qr) {
       s.qrText = qr;
-      try {
-        s.qrDataURL = await QRCode.toDataURL(qr);
-      } catch {
-        s.qrDataURL = null;
-      }
+      try { s.qrDataURL = await QRCode.toDataURL(qr); }
+      catch { s.qrDataURL = null; }
       s.status = 'qr';
       for (const res of s.sseClients) sseWrite(res, 'qr', { qrText: s.qrText, qrDataURL: s.qrDataURL });
       await notifyWebhook(s, 'session.status', { status: s.status });
@@ -258,7 +252,7 @@ async function startSock(sessionId: string) {
     await notifyWebhook(s, 'message.incoming', {
       from,
       message: content,
-      raw: undefined
+      raw: undefined // on n’envoie pas le raw pour alléger
     });
   });
 
@@ -301,7 +295,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'zuria-wa-gateway',
-    version: '1.0.1',
+    version: '1.0.2',
     auth_required: !AUTH_DISABLED && TOKENS.length > 0,
     tokensConfigured: TOKENS.length,
     sessions: [...sessions.values()].map(s => ({ id: s.id, status: s.status }))
@@ -366,6 +360,7 @@ app.get('/events/:id', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
 
+  // push état actuel
   sseWrite(res, 'status', { status: s.status, jid: s.jid ?? null, phone: s.phone ?? null });
   if (s.status === 'qr' && s.qrText) {
     sseWrite(res, 'qr', { qrText: s.qrText, qrDataURL: s.qrDataURL });
@@ -409,50 +404,3 @@ app.post('/sessions/:id/send-text', async (req, res) => {
   const appInstance = app.listen(PORT, HOST);
   appInstance.setTimeout?.(120000);
 })();
-// --- AUTH BLOCK (remplace ta logique d’auth actuelle par ceci) ---
-
-const AUTH_DISABLED = String(process.env.AUTH_DISABLED || '').trim() === '1';
-
-function normToken(s: string) {
-  return s.trim().replace(/^['"]|['"]$/g, ''); // enlève guillemets accidentels
-}
-const TOKENS = (process.env.AUTH_TOKENS || process.env.AUTH_TOKEN || '')
-  .split(',')
-  .map(normToken)
-  .filter(Boolean);
-
-function fp(s: string) {
-  const t = normToken(s);
-  if (!t) return { len: 0, head: '', tail: '' };
-  return { len: t.length, head: t.slice(0, 4), tail: t.slice(-4) };
-}
-
-function authOk(req: import('express').Request) {
-  if (AUTH_DISABLED) return true;           // 🔓 mode test
-  const b = (req.header('authorization') || '').trim();
-  const bearer = b.startsWith('Bearer ') ? b.slice(7).trim() : '';
-  const apiKey = (req.header('x-api-key') || '').trim();
-  const candidate = bearer || apiKey;
-  const ok = !!candidate && TOKENS.includes(normToken(candidate));
-
-  if (!ok) {
-    console.warn('[gw] auth FAILED', {
-      path: req.path, method: req.method,
-      bearer: fp(bearer), apiKey: fp(apiKey),
-      tokensConfigured: TOKENS.length
-    });
-  }
-  return ok;
-}
-
-app.use((req, res, next) => {
-  if (AUTH_DISABLED) return next();
-  if (!TOKENS.length) {
-    console.warn('[gw] no tokens configured; deny by default');
-    return res.status(403).json({ ok: false, error: 'forbidden' });
-  }
-  if (!authOk(req)) return res.status(403).json({ ok: false, error: 'forbidden' });
-  next();
-});
-
-// --- FIN AUTH BLOCK ---
