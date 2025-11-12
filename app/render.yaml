@@ -3,25 +3,19 @@ services:
     name: zuria-wa
     env: node
     plan: starter
-    autoDeploy: true
-    runtime: node
-    buildCommand: npm install && npm run build
-    startCommand: npm run start
+    region: frankfurt
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: 20
       - key: PORT
         value: 10000
-      - key: TOKENS
-        sync: false
-      - key: AUTH_DISABLED
-        value: "0"
-      - key: APP_NAME
-        value: Zuria.AI
-      - key: AUTH_DIR         # <-- nouveau: répertoire d'auth Baileys persistant
-        value: /data/baileys_auth
-    healthCheckPath: /health
-    disk:                      # <-- nouveau: disque persistant
-      name: baileys-auth
-      mountPath: /data
-      sizeGB: 1
+      - key: LOG_LEVEL
+        value: info
+      - key: DATA_DIR
+        value: /opt/render/project/data
+      # Définis AUTH_TOKEN dans le dashboard Render (Variables)
+      # - key: AUTH_TOKEN
+      #   sync: false
+    autoDeploy: true
