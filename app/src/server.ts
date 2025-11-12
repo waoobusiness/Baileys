@@ -1,275 +1,378 @@
-import 'dotenv/config'
-import express from 'express'
+import express, { Request, Response } from 'express'
 import cors from 'cors'
 import pino from 'pino'
-import QRCode from 'qrcode'
+import pinoHttp from 'pino-http'
 import { Boom } from '@hapi/boom'
 import {
-  BufferJSON,
-  makeWASocket,
   proto,
-  useMultiFileAuthState,
+  WASocket,
   DisconnectReason,
+  makeWASocket,
+  Browsers,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys'
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
+import fetch from 'node-fetch'
+import http from 'http'
 
-const logger = pino({ level: 'info', base: { app: process.env.APP_NAME || 'Zuria.AI' } })
+// ---------- Config ----------
 const PORT = Number(process.env.PORT || 10000)
-const AUTH_DIR = process.env.AUTH_DIR || '.baileys_auth'
-const TOKENS = (process.env.TOKENS || '').split(',').map(s => s.trim()).filter(Boolean)
-const AUTH_DISABLED = process.env.AUTH_DISABLED === '1'
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data', 'wa-auth')
+const AUTH_TOKEN = process.env.AUTH_TOKEN || ''           // si vide -> pas d’auth
+const AUTO_DOWNLOAD_MEDIA = process.env.AUTO_DOWNLOAD_MEDIA === '1'
 
-function authOk(req: express.Request) {
-  if (AUTH_DISABLED || TOKENS.length === 0) return true
-  const auth = req.headers.authorization?.replace(/^Bearer\s+/i, '')?.trim()
-  const xKey = String(req.headers['x-api-key'] || '').trim()
-  if (!auth && !xKey) return false
-  return TOKENS.includes(auth || xKey)
-}
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (!authOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
-  next()
+fs.mkdirSync(DATA_DIR, { recursive: true })
+
+// ---------- Logger ----------
+const logger = pino({ level: LOG_LEVEL })
+const httpLogger = pinoHttp({
+  logger,
+  customProps: (req) => ({ path: req.url, method: req.method })
+})
+
+// ---------- Helpers ----------
+function requireAuth(req: Request, res: Response): boolean {
+  if (!AUTH_TOKEN) return true
+  const header = req.header('authorization') || ''
+  const xApiKey = req.header('x-api-key') || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : header
+  const ok = token === AUTH_TOKEN || xApiKey === AUTH_TOKEN
+  if (!ok) res.status(403).json({ ok: false, error: 'forbidden' })
+  return ok
 }
 
-type SessionStatus = 'idle' | 'qr' | 'connecting' | 'connected' | 'closed' | 'error'
-type SseClient = { id: string; res: express.Response }
-type Session = {
+function sseHeaders() {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  }
+}
+
+function sendSse(res: Response, event: string, data: any) {
+  res.write(`event: ${event}\n`)
+  res.write(`data: ${JSON.stringify(data)}\n\n`)
+}
+
+function jidToPhone(jid?: string | null) {
+  if (!jid) return null
+  const m = jid.match(/^(\d+):?\d*@s\.whatsapp\.net$/)
+  return m ? m[1] : null
+}
+
+function toJid(to: string) {
+  return to.includes('@') ? to : `${to}@s.whatsapp.net`
+}
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+
+// ---------- Session Store ----------
+type WebhookCfg = { url?: string, secret?: string }
+type SseClient = { id: string, res: Response, heartbeat: NodeJS.Timeout }
+
+type SessionState = {
   id: string
-  status: SessionStatus
+  sock?: WASocket
+  status: 'idle'|'qr'|'connecting'|'open'|'close'|'error'
   lastQr?: string
-  lastJid?: string
-  sock?: ReturnType<typeof makeWASocket>
-  sseClients: SseClient[]
-  webhookUrl?: string
-  webhookSecret?: string
-  closing?: boolean
+  webhook: WebhookCfg
+  sse: Map<string, SseClient>
+  createdAt: number
+  connectedAt?: number
 }
-const sessions = new Map<string, Session>()
 
-function normalizeToJid(to: string) {
-  const v = String(to || '').trim()
-  if (!v) throw new Error('missing "to"')
-  return v.includes('@') ? v : `${v}@s.whatsapp.net`
+const sessions = new Map<string, SessionState>()
+
+function sessionPath(id: string) {
+  return path.join(DATA_DIR, 'sessions', id)
 }
-async function fetchAsBuffer(url: string): Promise<Buffer> {
-  const r = await fetch(url)
-  if (!r.ok) throw new Error(`download_failed:${r.status}`)
-  const ab = await r.arrayBuffer()
-  return Buffer.from(ab)
-}
-function emitSse(sess: Session, event: string, data: any) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-  for (const c of [...sess.sseClients]) {
-    try { c.res.write(payload) } catch {
-      const idx = sess.sseClients.findIndex(s => s.id === c.id)
-      if (idx >= 0) sess.sseClients.splice(idx, 1)
-    }
+
+async function createOrGetSession(id: string, webhook?: WebhookCfg): Promise<SessionState> {
+  let st = sessions.get(id)
+  if (st) {
+    if (webhook) st.webhook = webhook
+    return st
   }
-}
-async function postWebhook(sess: Session, body: any) {
-  if (!sess.webhookUrl) return
-  try {
-    const r = await fetch(sess.webhookUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(sess.webhookSecret ? { 'x-webhook-secret': sess.webhookSecret } : {}),
-      },
-      body: JSON.stringify(body),
-    })
-    if (!r.ok) logger.warn({ session: sess.id, status: r.status }, 'webhook non-200')
-  } catch (e) {
-    logger.warn({ session: sess.id, err: String(e) }, 'webhook error')
+  fs.mkdirSync(sessionPath(id), { recursive: true })
+  st = {
+    id,
+    status: 'idle',
+    webhook: webhook || {},
+    sse: new Map(),
+    createdAt: Date.now()
   }
-}
-async function waitConnected(sess: Session, timeoutMs = 8000) {
-  if (sess.status === 'connected') return true
-  const start = Date.now()
-  return new Promise<boolean>((resolve) => {
-    const iv = setInterval(() => {
-      if (sess.status === 'connected') { clearInterval(iv); resolve(true) }
-      else if (Date.now() - start > timeoutMs) { clearInterval(iv); resolve(false) }
-    }, 200)
-  })
+  sessions.set(id, st)
+  return st
 }
 
-async function ensureSession(id: string): Promise<Session> {
-  const existing = sessions.get(id)
-  if (existing?.sock) return existing
-
-  const { state, saveCreds } = await useMultiFileAuthState(`${AUTH_DIR}/${id}`)
+async function startSession(st: SessionState) {
+  const authDir = sessionPath(st.id)
+  const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const { version } = await fetchLatestBaileysVersion()
 
-  const sess: Session = { id, status: 'idle', sseClients: [] }
-  sessions.set(id, sess)
+  st.status = 'connecting'
 
   const sock = makeWASocket({
     version,
     printQRInTerminal: false,
-    auth: state,
-    browser: [process.env.APP_NAME || 'Zuria.AI', 'Chrome', '121'],
-    logger: pino({ level: 'silent' }),
+    browser: Browsers.macOS('Zuria.AI'),
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger)
+    },
+    logger,
     syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: true
   })
-  sess.sock = sock
+
+  st.sock = sock
+
+  // connection & QR updates
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u as any
+    if (qr) {
+      st.lastQr = qr
+      st.status = 'qr'
+      broadcast(st, 'qr', { session_id: st.id, qr })
+      await postWebhook(st, 'session.status', { status: 'qr', session_id: st.id })
+    }
+    if (connection === 'connecting') {
+      st.status = 'connecting'
+      broadcast(st, 'status', { session_id: st.id, status: 'connecting' })
+      await postWebhook(st, 'session.status', { status: 'connecting', session_id: st.id })
+    }
+    if (connection === 'open') {
+      st.status = 'open'
+      st.connectedAt = Date.now()
+      broadcast(st, 'status', { session_id: st.id, status: 'open' })
+      await postWebhook(st, 'session.status', { status: 'open', session_id: st.id })
+    }
+    if (connection === 'close') {
+      const err = (lastDisconnect?.error as Boom | undefined)
+      const code = (err?.output?.statusCode || 0) as number
+      st.status = 'close'
+      broadcast(st, 'status', { session_id: st.id, status: 'close', code })
+      await postWebhook(st, 'session.status', { status: 'close', session_id: st.id, code })
+      // auto-restart soft
+      await sleep(1200)
+      startSession(st).catch(e => logger.error({ e }, 'restart failed'))
+    }
+  })
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', async (u) => {
-    const { connection, lastDisconnect, qr } = u
+  // messages
+  sock.ev.on('messages.upsert', async m => {
+    const up = m as any
+    if (up.type !== 'notify') return
+    for (const msg of up.messages as proto.IWebMessageInfo[]) {
+      const fromMe = !!msg.key?.fromMe
+      const jid = (msg.key?.remoteJid || '') as string
+      const phone = jidToPhone(jid)
+      const id = msg.key?.id
+      const ts = Number(msg.messageTimestamp || Date.now()/1000) * 1000
 
-    if (qr) {
-      sess.status = 'qr'
-      sess.lastQr = await QRCode.toDataURL(qr, { margin: 0, scale: 6 })
-      emitSse(sess, 'qr', { session_id: id, qr: sess.lastQr })
-      await postWebhook(sess, { event: 'session.status', session_id: id, status: 'qr' })
-    }
-    if (connection === 'connecting') {
-      sess.status = 'connecting'
-      emitSse(sess, 'status', { session_id: id, status: 'connecting' })
-      await postWebhook(sess, { event: 'session.status', session_id: id, status: 'connecting' })
-    }
-    if (connection === 'open') {
-      sess.status = 'connected'
-      emitSse(sess, 'connected', { session_id: id })
-      await postWebhook(sess, { event: 'session.status', session_id: id, status: 'connected' })
-    }
-    if (connection === 'close') {
-      const reason = (lastDisconnect?.error as Boom)?.output?.statusCode
-      sess.status = 'closed'
-      emitSse(sess, 'closed', { session_id: id, reason })
-      await postWebhook(sess, { event: 'session.status', session_id: id, status: 'closed', reason })
-      if (!sess.closing && reason !== DisconnectReason.loggedOut) {
-        logger.info({ id }, 'restarting socket after close')
-        setTimeout(() => ensureSession(id).catch(() => {}), 800)
+      const payload: any = {
+        session_id: st.id,
+        direction: fromMe ? 'outgoing' : 'incoming',
+        jid,
+        phone,
+        message_id: id,
+        timestamp: ts,
+        message: normalizeMessage(msg)
       }
+      // enrich (best-effort)
+      try {
+        payload.profile = {
+          name: (sock?.contacts?.[jid]?.notify) || undefined
+        }
+        try { payload.profile.photoUrl = await sock?.profilePictureUrl(jid, 'image') as string } catch {}
+      } catch {}
+
+      broadcast(st, 'message', payload)
+      await postWebhook(st, `message.${fromMe ? 'outgoing' : 'incoming'}`, payload)
     }
   })
 
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages?.[0]
-    if (!msg) return
-    const from = msg.key.remoteJid
-    const isMe = !!msg.key.fromMe
-    if (isMe) await postWebhook(sess, { event: 'message.outgoing', session_id: id, jid: from, message: msg })
-    else     await postWebhook(sess, { event: 'message.incoming', session_id: id, jid: from, message: msg })
+  // receipts (optional)
+  sock.ev.on('messages.update', async updates => {
+    for (const u of updates) {
+      const jid = u.key?.remoteJid
+      const id = u.key?.id
+      const status = u.update?.status
+      const payload = { session_id: st.id, jid, id, status }
+      broadcast(st, 'receipt', payload)
+      await postWebhook(st, 'message.status', payload)
+    }
   })
-
-  return sess
 }
 
-async function closeSession(id: string, logout = true) {
-  const sess = sessions.get(id)
-  if (!sess) return
-  sess.closing = true
-  try { if (logout && sess.sock?.logout) await sess.sock.logout() } catch {}
-  try { sess.sock?.end(undefined) } catch {}
-  sessions.delete(id)
+function normalizeMessage(msg: proto.IWebMessageInfo) {
+  const m = msg.message
+  if (!m) return { type: 'unknown' }
+  if (m.conversation) return { type: 'text', text: m.conversation }
+  if (m.extendedTextMessage?.text) return { type: 'text', text: m.extendedTextMessage.text }
+  if (m.imageMessage) {
+    return { type: 'image', caption: m.imageMessage.caption, mimeType: m.imageMessage.mimetype }
+  }
+  if (m.audioMessage) {
+    return { type: 'audio', ptt: !!m.audioMessage.ptt, mimeType: m.audioMessage.mimetype, seconds: m.audioMessage.seconds }
+  }
+  if (m.documentMessage) return { type: 'document', fileName: m.documentMessage.fileName, mimeType: m.documentMessage.mimetype }
+  if (m.stickerMessage) return { type: 'sticker' }
+  return { type: 'unknown' }
 }
 
+function broadcast(st: SessionState, event: string, data: any) {
+  for (const [id, c] of st.sse.entries()) {
+    try { sendSse(c.res, event, data) } catch (e) { logger.warn({ id, e }, 'sse send failed') }
+  }
+}
+
+async function postWebhook(st: SessionState, event: string, data: any) {
+  if (!st.webhook?.url) return
+  try {
+    await fetch(st.webhook.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-webhook-secret': st.webhook.secret || ''
+      },
+      body: JSON.stringify({ event, ...data })
+    })
+  } catch (e) {
+    logger.warn({ e, url: st.webhook.url }, 'webhook post failed')
+  }
+}
+
+async function ensureConnected(st: SessionState) {
+  if (st.status === 'open' && st.sock) return
+  const err: any = new Error('not_connected'); err.status = 409; throw err
+}
+
+// ---------- HTTP Server ----------
 const app = express()
-app.disable('x-powered-by')
-app.use(cors({ origin: true }))
-app.use(express.json({ limit: '15mb' }))
+app.use(cors())
+app.use(express.json({ limit: '10mb' }))
+app.use(httpLogger)
 
-app.get('/health', (_req, res) => res.json({ ok: true }))
+// health
+app.get('/health', (req, res) => res.status(200).json({ ok: true, status: 'up', time: Date.now() }))
 
-app.get('/sessions', requireAuth, (_req, res) => {
-  const all = [...sessions.values()].map(s => ({
-    id: s.id, status: s.status, lastJid: s.lastJid, sseClients: s.sseClients.length
-  }))
-  res.json({ ok: true, sessions: all })
-})
-
-app.get('/sessions/:id/status', requireAuth, async (req, res) => {
-  const id = req.params.id
-  const sess = await ensureSession(id)
-  res.json({ ok: true, session_id: id, status: sess.status, has_qr: !!sess.lastQr })
-})
-
-app.post('/sessions/:id/start', requireAuth, async (req, res) => {
+// Start a session (called by Supabase wa-register)
+app.post('/sessions/:id/start', async (req, res) => {
+  if (!requireAuth(req, res)) return
   const id = req.params.id
   const { webhookUrl, webhookSecret } = req.body || {}
-  const sess = await ensureSession(id)
-  if (webhookUrl) sess.webhookUrl = webhookUrl
-  if (webhookSecret) sess.webhookSecret = webhookSecret
-  res.json({ ok: true, session_id: id, status: sess.status, has_qr: !!sess.lastQr })
+
+  const st = await createOrGetSession(id, { url: webhookUrl, secret: webhookSecret })
+  if (st.sock) {
+    // déjà lancé → renvoi statut instant
+    broadcast(st, 'status', { session_id: id, status: st.status })
+    return res.json({ ok: true, session_id: id, started: true, status: st.status })
+  }
+  startSession(st).catch(e => logger.error({ e }, 'startSession failed'))
+  res.json({ ok: true, session_id: id, started: true })
 })
 
-app.get('/sessions/:id/sse', requireAuth, async (req, res) => {
+// Reset: supprime l’auth et redémarre clean
+app.post('/sessions/:id/reset', async (req, res) => {
+  if (!requireAuth(req, res)) return
   const id = req.params.id
-  const sess = await ensureSession(id)
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
-  const client: SseClient = { id: Math.random().toString(36).slice(2), res }
-  sess.sseClients.push(client)
-  if (sess.status === 'qr' && sess.lastQr) emitSse(sess, 'qr', { session_id: id, qr: sess.lastQr })
-  else emitSse(sess, 'status', { session_id: id, status: sess.status })
-  req.on('close', () => {
-    const idx = sess.sseClients.findIndex(s => s.id === client.id)
-    if (idx >= 0) sess.sseClients.splice(idx, 1)
-  })
-})
-
-app.post('/sessions/:id/reset', requireAuth, async (req, res) => {
-  const id = req.params.id
-  await closeSession(id, true)
-  const sess = await ensureSession(id)
-  res.json({ ok: true, session_id: id, status: sess.status })
-})
-
-app.post('/sessions/:id/disconnect', requireAuth, async (req, res) => {
-  const id = req.params.id
-  await closeSession(id, true)
-  res.json({ ok: true, session_id: id })
-})
-
-app.post('/sessions/:id/messages', requireAuth, async (req, res) => {
-  const id = req.params.id
-  const { to, type } = req.body || {}
+  const st = await createOrGetSession(id)
   try {
-    if (!to) return res.status(400).json({ ok: false, error: 'missing_to' })
-    if (!type) return res.status(400).json({ ok: false, error: 'missing_type' })
+    const dir = sessionPath(id)
+    fs.rmSync(dir, { recursive: true, force: true })
+    st.sock?.end(undefined)
+    sessions.delete(id)
+  } catch (e) {
+    logger.warn({ e }, 'reset failed')
+  }
+  res.json({ ok: true, reset: true })
+})
 
-    const sess = await ensureSession(id)
+// SSE pour QR + status + messages
+app.get('/sessions/:id/events', async (req, res) => {
+  if (!requireAuth(req, res)) return
+  const id = req.params.id
+  const st = await createOrGetSession(id)
+  res.writeHead(200, sseHeaders())
 
-    // Attente courte si la socket vient d'être relancée
-    if (sess.status !== 'connected') {
-      const ok = await waitConnected(sess, 8000)
-      if (!ok || !sess.sock) return res.status(409).json({ ok: false, error: 'not_connected' })
-    }
+  const cid = crypto.randomUUID()
+  const heartbeat = setInterval(() => { try { res.write(':\n\n') } catch {} }, 15000)
+  st.sse.set(cid, { id: cid, res, heartbeat })
 
-    const jid = normalizeToJid(to)
-    let result: proto.WebMessageInfo | undefined
+  // push immédiat
+  sendSse(res, 'status', { session_id: id, status: st.status })
+  if (st.lastQr) sendSse(res, 'qr', { session_id: id, qr: st.lastQr })
 
+  req.on('close', () => { clearInterval(heartbeat); st.sse.delete(cid) })
+})
+
+// ENVOI multi-type: texte / image / audio(PTT)
+app.post('/sessions/:id/messages', async (req, res) => {
+  if (!requireAuth(req, res)) return
+  const id = req.params.id
+  const st = await createOrGetSession(id)
+  try { await ensureConnected(st) } catch (e: any) {
+    return res.status(e.status || 500).json({ ok: false, error: e.message || 'not_connected' })
+  }
+
+  const { to, type, text, mediaUrl, ptt, caption } = req.body || {}
+  if (!to) return res.status(400).json({ ok: false, error: 'missing_to' })
+  const jid = toJid(String(to))
+
+  try {
     if (type === 'text') {
-      const text = String(req.body.text || '').trim()
-      if (!text) return res.status(400).json({ ok: false, error: 'missing_text' })
-      result = await sess.sock!.sendMessage(jid, { text })
+      await st.sock!.sendMessage(jid, { text: String(text || '') })
     } else if (type === 'image') {
-      const { url, base64, caption } = req.body || {}
-      let media: Buffer | undefined
-      if (base64) media = Buffer.from(String(base64), 'base64')
-      else if (url) media = await fetchAsBuffer(String(url))
-      if (!media) return res.status(400).json({ ok: false, error: 'missing_media' })
-      result = await sess.sock!.sendMessage(jid, { image: media, caption: caption || undefined })
+      if (!mediaUrl) return res.status(400).json({ ok: false, error: 'missing_mediaUrl' })
+      const buf = Buffer.from(await (await fetch(mediaUrl)).arrayBuffer())
+      await st.sock!.sendMessage(jid, { image: buf, caption: caption || '' })
     } else if (type === 'audio') {
-      const { url, base64, ptt } = req.body || {}
-      let media: Buffer | undefined
-      if (base64) media = Buffer.from(String(base64), 'base64')
-      else if (url) media = await fetchAsBuffer(String(url))
-      if (!media) return res.status(400).json({ ok: false, error: 'missing_media' })
-      result = await sess.sock!.sendMessage(jid, { audio: media, ptt: !!ptt })
+      if (!mediaUrl) return res.status(400).json({ ok: false, error: 'missing_mediaUrl' })
+      const buf = Buffer.from(await (await fetch(mediaUrl)).arrayBuffer())
+      await st.sock!.sendMessage(jid, { audio: buf, ptt: !!ptt })
     } else {
       return res.status(400).json({ ok: false, error: 'unsupported_type' })
     }
-
-    return res.json({ ok: true, session_id: id, to: jid, key: result?.key || null })
+    res.json({ ok: true })
   } catch (e: any) {
-    logger.error({ err: String(e) }, 'send_message_error')
-    return res.status(502).json({ ok: false, error: 'gateway_send_failed', detail: String(e) })
+    logger.warn({ e }, 'send failed')
+    res.status(500).json({ ok: false, error: 'send_failed', detail: String(e?.message || e) })
   }
 })
 
-app.listen(PORT, () => {
-  logger.info({ port: PORT, authDir: AUTH_DIR }, 'Gateway listening')
+// Raccourcis
+app.post('/sessions/:id/messages/text', async (req, res) => {
+  req.body = { ...(req.body || {}), type: 'text' }
+  ;(app as any).handle(req, res)
 })
+app.post('/sessions/:id/messages/image', async (req, res) => {
+  req.body = { ...(req.body || {}), type: 'image' }
+  ;(app as any).handle(req, res)
+})
+app.post('/sessions/:id/messages/audio', async (req, res) => {
+  req.body = { ...(req.body || {}), type: 'audio' }
+  ;(app as any).handle(req, res)
+})
+
+// Statut simple
+app.get('/sessions/:id/status', async (req, res) => {
+  if (!requireAuth(req, res)) return
+  const id = req.params.id
+  const st = await createOrGetSession(id)
+  const phone = (() => {
+    try { return jidToPhone(st.sock?.user?.id) } catch { return null }
+  })()
+  res.json({ ok: true, session_id: id, status: st.status, phone, connected_at: st.connectedAt || null })
+})
+
+http.createServer(app).listen(PORT, () => logger.info({ port: PORT }, 'gateway listening'))
