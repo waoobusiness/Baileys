@@ -409,3 +409,50 @@ app.post('/sessions/:id/send-text', async (req, res) => {
   const appInstance = app.listen(PORT, HOST);
   appInstance.setTimeout?.(120000);
 })();
+// --- AUTH BLOCK (remplace ta logique d’auth actuelle par ceci) ---
+
+const AUTH_DISABLED = String(process.env.AUTH_DISABLED || '').trim() === '1';
+
+function normToken(s: string) {
+  return s.trim().replace(/^['"]|['"]$/g, ''); // enlève guillemets accidentels
+}
+const TOKENS = (process.env.AUTH_TOKENS || process.env.AUTH_TOKEN || '')
+  .split(',')
+  .map(normToken)
+  .filter(Boolean);
+
+function fp(s: string) {
+  const t = normToken(s);
+  if (!t) return { len: 0, head: '', tail: '' };
+  return { len: t.length, head: t.slice(0, 4), tail: t.slice(-4) };
+}
+
+function authOk(req: import('express').Request) {
+  if (AUTH_DISABLED) return true;           // 🔓 mode test
+  const b = (req.header('authorization') || '').trim();
+  const bearer = b.startsWith('Bearer ') ? b.slice(7).trim() : '';
+  const apiKey = (req.header('x-api-key') || '').trim();
+  const candidate = bearer || apiKey;
+  const ok = !!candidate && TOKENS.includes(normToken(candidate));
+
+  if (!ok) {
+    console.warn('[gw] auth FAILED', {
+      path: req.path, method: req.method,
+      bearer: fp(bearer), apiKey: fp(apiKey),
+      tokensConfigured: TOKENS.length
+    });
+  }
+  return ok;
+}
+
+app.use((req, res, next) => {
+  if (AUTH_DISABLED) return next();
+  if (!TOKENS.length) {
+    console.warn('[gw] no tokens configured; deny by default');
+    return res.status(403).json({ ok: false, error: 'forbidden' });
+  }
+  if (!authOk(req)) return res.status(403).json({ ok: false, error: 'forbidden' });
+  next();
+});
+
+// --- FIN AUTH BLOCK ---
