@@ -206,13 +206,21 @@ async function startSock(sessionId: string) {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      s.qrText = qr;
-      try { s.qrDataURL = await QRCode.toDataURL(qr); }
-      catch { s.qrDataURL = null; }
-      s.status = 'qr';
-      for (const res of s.sseClients) sseWrite(res, 'qr', { qrText: s.qrText, qrDataURL: s.qrDataURL });
-      await notifyWebhook(s, 'session.status', { status: s.status });
-    }
+  s.qrText = qr;
+  try { s.qrDataURL = await QRCode.toDataURL(qr); }
+  catch { s.qrDataURL = null; }
+
+  s.status = 'qr';
+
+  const payload = {
+    qrText: s.qrText,
+    qrDataURL: s.qrDataURL,
+    qrData: s.qrDataURL // 👈 alias pour compat avec front qui lit "qrData"
+  };
+
+  for (const res of s.sseClients) sseWrite(res, 'qr', payload);
+  await notifyWebhook(s, 'session.status', { status: s.status, hasQR: true });
+}
 
     if (connection === 'open') {
       s.status = 'connected';
