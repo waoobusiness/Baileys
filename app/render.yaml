@@ -1,23 +1,21 @@
 services:
   - type: web
-    name: cars-zuria-ai-baileys
+    name: zuria-wa
     env: node
     plan: starter
-    branch: app
-    rootDir: app
-    buildCommand: "npm ci && npm run build"
-    startCommand: "npm start"
     autoDeploy: true
-    disk:
-      name: baileys-auth
-      mountPath: /data
-      sizeGB: 2
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
     envVars:
       - key: NODE_VERSION
         value: 20
-      - key: DATA_DIR
-        value: /data/wa-auth
-      - key: LOG_LEVEL
-        value: info
-      - key: AUTO_DOWNLOAD_MEDIA
-        value: "1"
+      - key: PORT
+        value: 10000
+      - key: TOKENS
+        sync: false
+      - key: AUTH_DISABLED
+        value: "0"
+      - key: APP_NAME
+        value: Zuria.AI
+    healthCheckPath: /health
