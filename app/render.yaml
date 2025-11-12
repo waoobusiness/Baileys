@@ -18,4 +18,10 @@ services:
         value: "0"
       - key: APP_NAME
         value: Zuria.AI
+      - key: AUTH_DIR         # <-- nouveau: répertoire d'auth Baileys persistant
+        value: /data/baileys_auth
     healthCheckPath: /health
+    disk:                      # <-- nouveau: disque persistant
+      name: baileys-auth
+      mountPath: /data
+      sizeGB: 1
