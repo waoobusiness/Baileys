@@ -1,17 +1,16 @@
 {
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "target": "ES2020",
-    "module": "ES2020",
-    "lib": ["ES2020"],
-    "moduleResolution": "node",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "outDir": "dist",
+    "rootDir": "src",
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
     "resolveJsonModule": true,
-    "strict": false,
-    "noEmitOnError": false,
-    "sourceMap": true
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": false
   },
-  "include": ["server.ts"]
+  "include": ["src"]
 }
