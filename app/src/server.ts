@@ -144,16 +144,17 @@ async function startSession(orgId: string) {
     }
     if (connection === "close") {
       const code = (lastDisconnect as any)?.error?.output?.statusCode
+      // IMPORTANT: deviceRemoved n'existe pas dans cette version.
+      // On évite la reconnexion automatique seulement pour loggedOut & badSession.
       const willReconnect =
         code !== DisconnectReason.loggedOut &&
-        code !== DisconnectReason.deviceRemoved &&
         code !== DisconnectReason.badSession
       sess!.status = "closed"
-      getBus(orgId).emit("status", { type: "closed", code })
-      logger.warn({ orgId, code }, "WA closed")
-      if (!willReconnect) {
-        // keep auth for manual relogin; to fully reset, remove dir here.
-      }
+      getBus(orgId).emit("status", { type: "closed", code, willReconnect })
+      logger.warn({ orgId, code, willReconnect }, "WA closed")
+      // Ici tu peux rebooter/recréer la socket si tu veux une reconnexion automatique.
+      // Exemple:
+      // if (willReconnect) setTimeout(() => startSession(orgId).catch(() => {}), 2000)
     }
   })
 
@@ -456,7 +457,6 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       { logger, reuploadRequest: s.sock!.updateMediaMessage }
     )
 
-    // Déterminer le mimetype au mieux
     const m =
       (msg.message as any)?.imageMessage?.mimetype ||
       (msg.message as any)?.videoMessage?.mimetype ||
