@@ -1,20 +1,23 @@
 {
   "name": "cars-zuria-baileys-app-pro",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts",
-    "lint": "echo \"(lint non configuré)\""
+    "dev": "tsx watch src/server.ts"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
     "cors": "^2.8.5",
-    "express": "^4.21.1"
+    "express": "^4.21.1",
+    "file-type": "^19.6.0",
+    "fs-extra": "^11.2.0",
+    "lru-cache": "^11.0.1",
+    "mime-types": "^2.1.35",
+    "pino": "^9.3.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
