@@ -278,9 +278,7 @@ function buildZapiLikeMessage(
       ptt: !!m.audioMessage.ptt,
       seconds: m.audioMessage.seconds || 0,
       audioUrl:
-        msg.key.id && PUBLIC_URL
-          ? buildMediaUrl(orgId, msg.key.id)
-          : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       mimeType: m.audioMessage.mimetype || "audio/ogg; codecs=opus",
       viewOnce: false,
     };
@@ -290,13 +288,9 @@ function buildZapiLikeMessage(
   if (m.imageMessage) {
     base.image = {
       imageUrl:
-        msg.key.id && PUBLIC_URL
-          ? buildMediaUrl(orgId, msg.key.id)
-          : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       thumbnailUrl:
-        msg.key.id && PUBLIC_URL
-          ? buildMediaUrl(orgId, msg.key.id)
-          : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.imageMessage.caption || "",
       mimeType: m.imageMessage.mimetype || "image/jpeg",
       viewOnce: !!m.imageMessage.viewOnce,
@@ -309,9 +303,7 @@ function buildZapiLikeMessage(
   if (m.videoMessage) {
     base.video = {
       videoUrl:
-        msg.key.id && PUBLIC_URL
-          ? buildMediaUrl(orgId, msg.key.id)
-          : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.videoMessage.caption || "",
       mimeType: m.videoMessage.mimetype || "video/mp4",
       viewOnce: !!m.videoMessage.viewOnce,
@@ -323,9 +315,7 @@ function buildZapiLikeMessage(
   if (m.documentMessage) {
     base.document = {
       documentUrl:
-        msg.key.id && PUBLIC_URL
-          ? buildMediaUrl(orgId, msg.key.id)
-          : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       fileName: m.documentMessage.fileName,
       mimeType: m.documentMessage.mimetype,
       fileSize: m.documentMessage.fileLength,
@@ -668,7 +658,7 @@ async function startSession(orgId: string): Promise<Session> {
         body,
       };
 
-      // 🔴 SSE pour Lovable (UI) — on ne change rien ici
+      // 🔴 SSE pour Lovable (UI)
       getBus(orgId).emit("message", {
         type: "message",
         message: simplified,
@@ -688,21 +678,6 @@ async function startSession(orgId: string): Promise<Session> {
         };
 
         void postWebhook("message.incoming", orgId, webhookPayload);
-      }
-    }
-  });
-
-      // SSE pour Lovable (UI)
-      getBus(orgId).emit("message", {
-        type: "message",
-        message: simplified,
-      });
-
-      // Webhook Z-API-like pour les messages entrants (clients → toi)
-      if (!msg.key.fromMe) {
-        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
-        // ⬇️ payload = [ { ... } ] comme Z-API
-        void postWebhook("message.incoming", orgId, [zmsg]);
       }
     }
   });
