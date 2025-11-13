@@ -38,6 +38,10 @@ const SESSIONS_DIR =
 const WEBHOOK_URL =
   process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
+// 🌍 URL publique de la gateway (pour mediaUrl)
+const PUBLIC_URL =
+  process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
+
 // ----------- App
 
 const app = express();
@@ -145,6 +149,30 @@ async function clearSessionAuth(orgId: string) {
   }
 }
 
+// ----------- Helpers divers
+
+function jidToPhone(jid?: string | null): string | null {
+  if (!jid) return null;
+  const digits = jid.replace(/[^\d]/g, "");
+  return digits || null;
+}
+
+function getConnectedPhone(sess: Session): string | null {
+  const jid = sess.sock?.user?.id; // ex: "41782640976:52@s.whatsapp.net"
+  if (!jid) return null;
+  const main = jid.split(":")[0];
+  const digits = main.replace(/[^\d]/g, "");
+  return digits || null;
+}
+
+function buildMediaUrl(orgId: string, msgId: string): string | null {
+  if (!PUBLIC_URL) return null;
+  const base = PUBLIC_URL.replace(/\/+$/, "");
+  return `${base}/wa/media/${encodeURIComponent(orgId)}/${encodeURIComponent(
+    msgId
+  )}`;
+}
+
 // ----------- Helper: extraire le texte d’un message
 
 function extractMessageBody(msg: WAMessage): string | undefined {
@@ -185,6 +213,145 @@ async function postWebhook(
   } catch (err) {
     logger.error({ err, orgId, event }, "webhook error");
   }
+}
+
+// ----------- Helper: payload style Z-API pour un message
+
+function buildZapiLikeMessage(
+  msg: WAMessage,
+  sess: Session,
+  orgId: string
+): any {
+  const m: any = msg.message || {};
+  const connectedPhone = getConnectedPhone(sess);
+  const phone = jidToPhone(msg.key.remoteJid as string);
+  const isGroup = (msg.key.remoteJid || "").endsWith("@g.us");
+  const fromMe = !!msg.key.fromMe;
+  const tsSec = Number(msg.messageTimestamp || 0) || 0;
+  const tsMs = tsSec * 1000;
+
+  const contact =
+    sess.contacts.get(msg.key.remoteJid || "") ||
+    (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
+
+  const displayName =
+    contact?.name ||
+    contact?.shortName ||
+    (msg as any).pushName ||
+    phone ||
+    msg.key.remoteJid;
+
+  const base: any = {
+    isStatusReply: false,
+    chatLid: null, // pas dispo avec Baileys
+    connectedPhone,
+    waitingMessage: false,
+    isEdit: false,
+    isGroup,
+    isNewsletter: false,
+    instanceId: orgId,
+    messageId: msg.key.id,
+    phone,
+    fromMe,
+    momment: tsMs,
+    status: fromMe ? "SENT" : "RECEIVED",
+    chatName: displayName,
+    senderPhoto: null,
+    senderName: displayName,
+    photo: null,
+    broadcast: false,
+    participantLid: null,
+    forwarded: !!m.contextInfo?.isForwarded,
+    type: "ReceivedCallback",
+    fromApi: false,
+  };
+
+  // Texte
+  const body = extractMessageBody(msg);
+  if (body) {
+    base.text = { message: body };
+  }
+
+  // Audio
+  if (m.audioMessage) {
+    base.audio = {
+      ptt: !!m.audioMessage.ptt,
+      seconds: m.audioMessage.seconds || 0,
+      audioUrl:
+        msg.key.id && PUBLIC_URL
+          ? buildMediaUrl(orgId, msg.key.id)
+          : null,
+      mimeType: m.audioMessage.mimetype || "audio/ogg; codecs=opus",
+      viewOnce: false,
+    };
+  }
+
+  // Image
+  if (m.imageMessage) {
+    base.image = {
+      imageUrl:
+        msg.key.id && PUBLIC_URL
+          ? buildMediaUrl(orgId, msg.key.id)
+          : null,
+      thumbnailUrl:
+        msg.key.id && PUBLIC_URL
+          ? buildMediaUrl(orgId, msg.key.id)
+          : null,
+      caption: m.imageMessage.caption || "",
+      mimeType: m.imageMessage.mimetype || "image/jpeg",
+      viewOnce: !!m.imageMessage.viewOnce,
+      width: m.imageMessage.width || 0,
+      height: m.imageMessage.height || 0,
+    };
+  }
+
+  // Video
+  if (m.videoMessage) {
+    base.video = {
+      videoUrl:
+        msg.key.id && PUBLIC_URL
+          ? buildMediaUrl(orgId, msg.key.id)
+          : null,
+      caption: m.videoMessage.caption || "",
+      mimeType: m.videoMessage.mimetype || "video/mp4",
+      viewOnce: !!m.videoMessage.viewOnce,
+      seconds: m.videoMessage.seconds || 0,
+    };
+  }
+
+  // Document
+  if (m.documentMessage) {
+    base.document = {
+      documentUrl:
+        msg.key.id && PUBLIC_URL
+          ? buildMediaUrl(orgId, msg.key.id)
+          : null,
+      fileName: m.documentMessage.fileName,
+      mimeType: m.documentMessage.mimetype,
+      fileSize: m.documentMessage.fileLength,
+    };
+  }
+
+  // Réaction
+  if (m.reactionMessage) {
+    base.reaction = {
+      value:
+        m.reactionMessage.text ||
+        m.reactionMessage.emoji ||
+        m.reactionMessage.reaction ||
+        "",
+      time: tsMs,
+      reactionBy: phone,
+      referencedMessage: {
+        messageId: m.reactionMessage.key?.id,
+        fromMe: m.reactionMessage.key?.fromMe,
+        phone: jidToPhone(m.reactionMessage.key?.remoteJid) || null,
+        participant: m.reactionMessage.key?.participant || null,
+      },
+    };
+  }
+
+  return base;
 }
 
 // Helpers pour normaliser ce qu’on garde en mémoire
@@ -501,17 +668,17 @@ async function startSession(orgId: string): Promise<Session> {
         body,
       };
 
-      // SSE pour Lovable
+      // SSE pour Lovable (UI)
       getBus(orgId).emit("message", {
         type: "message",
         message: simplified,
       });
 
-      // Webhook uniquement pour les messages entrants (clients → toi)
+      // Webhook Z-API-like pour les messages entrants (clients → toi)
       if (!msg.key.fromMe) {
-        void postWebhook("message.incoming", orgId, {
-          ...simplified,
-        });
+        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+        // ⬇️ payload = [ { ... } ] comme Z-API
+        void postWebhook("message.incoming", orgId, [zmsg]);
       }
     }
   });
@@ -1049,6 +1216,48 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       mimetype: m,
       base64: `data:${m};base64,${base64}`,
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ➕ GET direct pour media (pour audioUrl / imageUrl style Z-API)
+app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
+  const { orgId, msgId } = req.params;
+  if (!orgId || !msgId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,msgId required" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  const msg = s.msgCache.get(String(msgId));
+  if (!msg) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Message not in cache" });
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger, reuploadRequest: s.sock!.updateMediaMessage }
+    );
+
+    const m =
+      (msg.message as any)?.imageMessage?.mimetype ||
+      (msg.message as any)?.videoMessage?.mimetype ||
+      (msg.message as any)?.documentMessage?.mimetype ||
+      (msg.message as any)?.audioMessage?.mimetype ||
+      mimeLookup("bin") ||
+      "application/octet-stream";
+
+    res.setHeader("Content-Type", m as string);
+    res.send(buffer);
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
