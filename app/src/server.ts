@@ -668,6 +668,30 @@ async function startSession(orgId: string): Promise<Session> {
         body,
       };
 
+      // 🔴 SSE pour Lovable (UI) — on ne change rien ici
+      getBus(orgId).emit("message", {
+        type: "message",
+        message: simplified,
+      });
+
+      // 🔔 Webhook Supabase (INBOUND) :
+      // -> on GARDE l'ancien format: payload.body / payload.from / payload.pushName
+      // -> on AJOUTE en plus payload.zapi avec la version "Z-API-like"
+      if (!msg.key.fromMe) {
+        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+
+        const webhookPayload = {
+          // ancien format (compatibilité avec ton wa-webhook actuel)
+          ...simplified,
+          // nouveau champ: message complet façon Z-API
+          zapi: zmsg,
+        };
+
+        void postWebhook("message.incoming", orgId, webhookPayload);
+      }
+    }
+  });
+
       // SSE pour Lovable (UI)
       getBus(orgId).emit("message", {
         type: "message",
