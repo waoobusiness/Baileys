@@ -181,6 +181,63 @@ function normalizeContact(raw: any): ContactSummary | null {
   return { id, name, notify, shortName };
 }
 
+// ➕ Helper pour extraire le contenu lisible du message (texte + images + audio, etc.)
+function extractMessageBody(msg: WAMessage): string | undefined {
+  const m = msg.message;
+  if (!m) return undefined;
+
+  // Texte simple
+  if (m.conversation) return m.conversation;
+
+  // Texte enrichi (préviews, replies, etc.)
+  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
+
+  // Images (on prend la légende si présente, sinon placeholder)
+  if (m.imageMessage) {
+    if (m.imageMessage.caption) return m.imageMessage.caption;
+    return "🖼️ Image";
+  }
+
+  // Vidéos (même logique)
+  if (m.videoMessage) {
+    if (m.videoMessage.caption) return m.videoMessage.caption;
+    return "🎥 Vidéo";
+  }
+
+  // Audio (on met un petit placeholder)
+  if (m.audioMessage) {
+    const secs = (m.audioMessage as any).seconds;
+    if (secs) {
+      return `🎧 Audio (${secs}s)`;
+    }
+    return "🎧 Audio";
+  }
+
+  // Documents
+  if (m.documentMessage) {
+    const fileName = m.documentMessage.fileName;
+    return fileName ? `📄 Document: ${fileName}` : "📄 Document";
+  }
+
+  // Stickers
+  if (m.stickerMessage) {
+    return "🟩 Sticker";
+  }
+
+  // Contacts
+  if (m.contactsArrayMessage) {
+    return "👤 Contact";
+  }
+
+  // Localisation
+  if (m.locationMessage || (m.liveLocationMessage as any)) {
+    return "📍 Localisation";
+  }
+
+  // Par défaut on ne met rien si on ne sait pas
+  return undefined;
+}
+
 // ----------- Session bootstrap
 
 async function startSession(orgId: string): Promise<Session> {
@@ -346,7 +403,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing = sess!.chats.get(id) || { id } as ChatSummary;
+      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
 
       const merged: ChatSummary = {
         ...existing,
@@ -424,6 +481,9 @@ async function startSession(orgId: string): Promise<Session> {
       if (msg.key && msg.key.id) {
         sess!.msgCache.set(msg.key.id, msg);
       }
+
+      const body = extractMessageBody(msg); // ➕ on récupère le contenu lisible
+
       getBus(orgId).emit("message", {
         type: "message",
         message: {
@@ -433,6 +493,7 @@ async function startSession(orgId: string): Promise<Session> {
           pushName: (msg as any).pushName,
           timestamp: (msg.messageTimestamp || 0).toString(),
           messageType: msg.message ? Object.keys(msg.message)[0] : undefined,
+          body, // ➕ texte / caption / placeholder
         },
       });
     }
@@ -914,6 +975,7 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
       fromMe: msg.key.fromMe,
       timestamp: (msg.messageTimestamp || 0).toString(),
       type: msg.message ? Object.keys(msg.message)[0] : undefined,
+      body: extractMessageBody(msg), // ➕ on renvoie aussi le contenu
     });
   });
 
