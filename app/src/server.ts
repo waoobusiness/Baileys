@@ -1,304 +1,171 @@
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import pino from 'pino'
-import { Boom } from '@hapi/boom'
-import QRCode from 'qrcode'
-import {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  Browsers,
-  WASocket,
-  WAMessage,
-} from '@whiskeysockets/baileys'
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+// server.ts - Gateway WhatsApp (Render)
+// npm i express cors eventemitter3 uuid @whiskeysockets/baileys
+import express from "express";
+import cors from "cors";
+import { EventEmitter } from "eventemitter3";
+import { v4 as uuid } from "uuid";
+// import { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } from "@whiskeysockets/baileys";
 
-const logger = pino({ level: 'info' })
-const app = express()
-app.use(cors())
-app.use(express.json({ limit: '5mb' }))
+const app = express();
+app.use(express.json());
+app.use(cors({ origin: process.env.CORS_ALLOW_ORIGIN?.split(",") ?? ["*"] }));
 
-const PORT = Number(process.env.PORT || 10000)
-const AUTH_TOKEN = process.env.AUTH_TOKEN || ''
-const AUTH_DIR = process.env.AUTH_DIR || '.baileys_auth'
-const WEBHOOK_BASE = (process.env.WEBHOOK_BASE || '').replace(/\/+$/, '')
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
-const BROWSER_NAME = process.env.BROWSER_NAME || 'Zuria.AI'
-
-if (!AUTH_TOKEN) logger.warn('AUTH_TOKEN is empty; set a strong token!')
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true })
-
-// --------- Auth middleware ----------
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const h = req.headers['authorization'] || ''
-  const token = h.startsWith('Bearer ') ? h.slice(7) : ''
-  if (!AUTH_TOKEN || token !== AUTH_TOKEN) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' })
-  }
-  next()
+// --- Sécurité simple entre Edge Function et Gateway ---
+const EDGE_TOKEN = process.env.EDGE_TOKEN || "";
+function requireEdgeToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const t = req.header("x-edge-token");
+  if (!EDGE_TOKEN || t === EDGE_TOKEN) return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
-// --------- Session store (in-memory) ----------
-type SseClient = { id: string; res: express.Response }
+// --- Mémoire: sessions, locks, bus SSE ---
 type Session = {
-  id: string
-  sock?: WASocket
-  sse: Map<string, SseClient>
-  webhookUrl?: string
-  webhookSecret?: string
-  connected: boolean
-}
-const sessions = new Map<string, Session>()
+  orgId: string;
+  sessionId: string;
+  status: "pending" | "qr" | "connected" | "error";
+  events: EventEmitter;
+  startedAt: number;
+  // sock?: ReturnType<typeof makeWASocket>;
+  starting: boolean;
+};
+const sessions = new Map<string, Session>();       // key: sessionId
+const orgToSession = new Map<string, string>();    // key: orgId -> sessionId
+const startingOrgs = new Set<string>();            // simple lock anti-doublon
 
-function getSession(id: string) {
-  let s = sessions.get(id)
-  if (!s) {
-    s = { id, sse: new Map(), connected: false }
-    sessions.set(id, s)
+// --- Helpers SSE ---
+function sseHeaders() {
+  return {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    // Optionnel: pour proxies
+    "X-Accel-Buffering": "no",
+  };
+}
+function sseWrite(res: express.Response, event: string, data: any) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// --- Boot / Reuse d'une session ---
+async function startOrReuseSession(orgId: string): Promise<Session> {
+  // Si on a déjà une session active pour cet org, on la renvoie
+  const existingId = orgToSession.get(orgId);
+  if (existingId) {
+    const s = sessions.get(existingId);
+    if (s) return s;
+    orgToSession.delete(orgId);
   }
-  return s
-}
 
-// --------- Helpers ----------
-async function sendWebhook(session: Session, payload: any) {
+  // Lock anti-démarrage concurrent
+  if (startingOrgs.has(orgId)) {
+    // On attend que l'autre boucle finisse (polling soft)
+    await new Promise((r) => setTimeout(r, 500));
+    const again = orgToSession.get(orgId);
+    if (again && sessions.get(again)) return sessions.get(again)!;
+  }
+
+  startingOrgs.add(orgId);
   try {
-    if (!session.webhookUrl || !WEBHOOK_BASE) return
-    await fetch(session.webhookUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-webhook-secret': session.webhookSecret || WEBHOOK_SECRET,
-      },
-      body: JSON.stringify(payload),
-    })
-  } catch (e) {
-    logger.warn({ msg: 'webhook failed', id: session.id, error: String(e) })
+    const sessionId = `org_${orgId}__ephem_${Date.now()}_${uuid().slice(0, 8)}`;
+    const events = new EventEmitter();
+
+    const session: Session = {
+      orgId, sessionId, events,
+      status: "pending",
+      startedAt: Date.now(),
+      starting: true,
+    };
+    sessions.set(sessionId, session);
+    orgToSession.set(orgId, sessionId);
+
+    // --- Ici on boot Baileys (ex: en single-file auth en mémoire ou disque)
+    // const { state, saveCreds } = await useMultiFileAuthState(`./auth/${sessionId}`);
+    // const sock = makeWASocket({
+    //   auth: state,
+    //   browser: Browsers.macOS("Zuria.AI"),
+    //   printQRInTerminal: false,
+    //   syncFullHistory: false,
+    // });
+    // session.sock = sock;
+
+    // sock.ev.on("creds.update", saveCreds);
+    // sock.ev.on("connection.update", (u) => {
+    //   const { connection, lastDisconnect, qr } = u;
+    //   if (qr) {
+    //     session.status = "qr";
+    //     events.emit("qr", { qr });
+    //   }
+    //   if (connection === "open") {
+    //     session.status = "connected";
+    //     events.emit("status", { status: "connected" });
+    //   }
+    //   if (connection === "close") {
+    //     const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+    //     events.emit("status", { status: "closed", reason });
+    //   }
+    // });
+
+    // --- DEMO: sans Baileys branché, on simule un QR puis "connected"
+    setTimeout(() => { session.status = "qr"; events.emit("qr", { qr: "qr-data-demo" }); }, 1200);
+    setTimeout(() => { session.status = "connected"; events.emit("status", { status: "connected" }); }, 6000);
+
+    session.starting = false;
+    return session;
+  } finally {
+    startingOrgs.delete(orgId);
   }
 }
 
-function sseSend(session: Session, event: string, data: any) {
-  session.sse.forEach(({ res }) => {
-    res.write(`event: ${event}\n`)
-    res.write(`data: ${JSON.stringify(data)}\n\n`)
-  })
-}
+// --- API: créer / récupérer une session depuis org_id ---
+app.post("/sessions", requireEdgeToken, async (req, res) => {
+  const orgId = String(req.query.org_id ?? req.body?.org_id ?? "").trim();
+  if (!orgId) return res.status(400).json({ ok: false, error: "org_id_required" });
 
-async function rmrf(dir: string) {
   try {
-    await fs.promises.rm(dir, { recursive: true, force: true })
-  } catch { /* no-op */ }
-}
-
-function normalizeJid(to: string): string {
-  return to.includes('@') ? to : `${to}@s.whatsapp.net`
-}
-
-// --------- Start Baileys session ----------
-async function startSession(id: string, opts?: { webhookUrl?: string; webhookSecret?: string }) {
-  const session = getSession(id)
-  if (opts?.webhookUrl) session.webhookUrl = opts.webhookUrl
-  if (opts?.webhookSecret) session.webhookSecret = opts.webhookSecret
-
-  const dir = path.join(AUTH_DIR, id)
-  fs.mkdirSync(dir, { recursive: true })
-  const { state, saveCreds } = await useMultiFileAuthState(dir)
-
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.macOS(BROWSER_NAME),
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-  })
-  session.sock = sock
-
-  sock.ev.on('creds.update', saveCreds)
-
-  // Connection updates (QR, status, errors)
-  sock.ev.on('connection.update', async (u) => {
-    const { connection, lastDisconnect, qr } = u
-
-    if (qr) {
-      // Envoyer le QR sous forme dataURL (lisible direct par le frontend)
-      const dataUrl = await QRCode.toDataURL(qr, { margin: 0 })
-      sseSend(session, 'qr', { session_id: id, qrData: dataUrl })
-      // Et notifier le webhook (utile pour Supabase)
-      await sendWebhook(session, { event: 'session.status', session_id: id, status: 'qr' })
-    }
-
-    if (connection === 'open') {
-      session.connected = true
-      sseSend(session, 'status', { session_id: id, status: 'connected' })
-      await sendWebhook(session, { event: 'session.status', session_id: id, status: 'connected' })
-      logger.info({ app: BROWSER_NAME, id, msg: 'connected to WA' })
-    }
-
-    if (connection === 'close') {
-      session.connected = false
-      const reason = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode
-      sseSend(session, 'status', { session_id: id, status: 'closed', reason })
-      await sendWebhook(session, { event: 'session.status', session_id: id, status: 'closed', reason })
-      const shouldReconnect = reason !== DisconnectReason.loggedOut
-      logger.info({ app: BROWSER_NAME, id, reason, msg: 'socket closed' })
-      if (shouldReconnect) {
-        logger.info({ app: BROWSER_NAME, id, msg: 'restarting socket after close' })
-        startSession(id, opts).catch(() => {})
-      }
-    }
-
-    if (connection === 'connecting') {
-      sseSend(session, 'status', { session_id: id, status: 'connecting' })
-      await sendWebhook(session, { event: 'session.status', session_id: id, status: 'connecting' })
-    }
-  })
-
-  // Incoming messages
-  sock.ev.on('messages.upsert', async (m) => {
-    if (m.type !== 'notify') return
-    for (const msg of m.messages as WAMessage[]) {
-      const from = msg.key.remoteJid || ''
-      const isMe = !!msg.key.fromMe
-      const text =
-        (msg.message?.conversation) ||
-        (msg.message?.extendedTextMessage?.text) ||
-        (msg.message?.imageMessage?.caption) ||
-        ''
-      const payload = {
-        event: isMe ? 'message.outgoing' : 'message.incoming',
-        session_id: id,
-        from,
-        message: { text },
-        timestamp: Date.now()
-      }
-      await sendWebhook(session, payload)
-
-      // Auto-détection “connected” si le gateway de l’autre côté n’envoie pas l’event
-      if (!session.connected) {
-        session.connected = true
-        sseSend(session, 'status', { session_id: id, status: 'connected' })
-        await sendWebhook(session, { event: 'session.status', session_id: id, status: 'connected' })
-      }
-    }
-  })
-
-  return session
-}
-
-// ---------- HTTP endpoints ----------
-app.get('/health', (_req, res) => res.json({ ok: true }))
-
-// Start pairing / keep-alive QR via SSE
-app.post('/sessions/:id/start', requireAuth, async (req, res) => {
-  try {
-    const id = req.params.id
-    const { webhookUrl, webhookSecret } = req.body || {}
-    await startSession(id, { webhookUrl: webhookUrl || `${WEBHOOK_BASE}`, webhookSecret: webhookSecret || WEBHOOK_SECRET })
-    return res.json({ ok: true, session_id: id })
-  } catch (e) {
-    logger.error({ err: String(e) })
-    return res.status(500).json({ ok: false, error: 'start_failed' })
+    const s = await startOrReuseSession(orgId);
+    return res.json({ ok: true, session_id: s.sessionId });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: "session_start_failed", details: String(e?.message || e) });
   }
-})
+});
 
-// Force reset (logout + purge auth files)
-app.post('/sessions/:id/reset', requireAuth, async (req, res) => {
-  const id = req.params.id
-  try {
-    const s = sessions.get(id)
-    if (s?.sock) {
-      try { await s.sock.logout() } catch { /* ignore */ }
-    }
-    sessions.delete(id)
-    await rmrf(path.join(AUTH_DIR, id))
-    sseSend({ id, sse: new Map(), connected: false }, 'status', { session_id: id, status: 'reset' })
-    return res.json({ ok: true })
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: 'reset_failed' })
-  }
-})
+// --- SSE: stream des événements de la session ---
+app.get("/sessions/:sessionId/events", requireEdgeToken, (req, res) => {
+  const { sessionId } = req.params;
+  const s = sessions.get(sessionId);
+  if (!s) return res.status(404).send("session_not_found");
 
-// SSE for QR + status
-app.get('/sessions/:id/sse', requireAuth, async (req, res) => {
-  const id = req.params.id
-  const s = getSession(id)
+  res.writeHead(200, sseHeaders());
 
-  res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache, no-transform')
-  res.setHeader('Connection', 'keep-alive')
-  res.flushHeaders?.()
+  // bootstrap: envoyer l'état courant
+  sseWrite(res, "status", { status: s.status, sessionId });
 
-  const clientId = Math.random().toString(36).slice(2)
-  s.sse.set(clientId, { id: clientId, res })
-  res.write(`event: status\ndata: ${JSON.stringify({ session_id: id, status: s.connected ? 'connected' : 'connecting' })}\n\n`)
+  // listeners
+  const onQR = (payload: any) => sseWrite(res, "qr", { ...payload, sessionId });
+  const onStatus = (payload: any) => sseWrite(res, "status", { ...payload, sessionId });
+  const onError = (payload: any) => sseWrite(res, "error", { ...payload, sessionId });
 
-  req.on('close', () => {
-    s.sse.delete(clientId)
-  })
-})
+  s.events.on("qr", onQR);
+  s.events.on("status", onStatus);
+  s.events.on("error", onError);
 
-// Status check
-app.get('/sessions/:id/status', requireAuth, (req, res) => {
-  const id = req.params.id
-  const s = getSession(id)
-  return res.json({ ok: true, session_id: id, connected: !!s.connected })
-})
+  // keepalive every 25s
+  const ka = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
 
-// SEND: unified endpoint (text / image / audio)
-app.post('/sessions/:id/messages', requireAuth, async (req, res) => {
-  const id = req.params.id
-  const { to, type, text, mediaUrl, ptt } = req.body || {}
-  if (!to || !type) return res.status(400).json({ ok: false, error: 'bad_request' })
+  req.on("close", () => {
+    clearInterval(ka);
+    s.events.off("qr", onQR);
+    s.events.off("status", onStatus);
+    s.events.off("error", onError);
+    res.end();
+  });
+});
 
-  const s = getSession(id)
-  const sock = s.sock
-  if (!sock) return res.status(409).json({ ok: false, error: 'not_connected' })
+// --- Santé & debug ---
+app.get("/healthz", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-  const jid = normalizeJid(String(to))
-  try {
-    if (type === 'text') {
-      await sock.sendMessage(jid, { text: String(text ?? '') })
-    } else if (type === 'image') {
-      if (!mediaUrl) return res.status(400).json({ ok: false, error: 'mediaUrl_required' })
-      const buf = Buffer.from(await (await fetch(mediaUrl)).arrayBuffer())
-      await sock.sendMessage(jid, { image: buf, caption: String(text ?? '') })
-    } else if (type === 'audio') {
-      if (!mediaUrl) return res.status(400).json({ ok: false, error: 'mediaUrl_required' })
-      const buf = Buffer.from(await (await fetch(mediaUrl)).arrayBuffer())
-      await sock.sendMessage(jid, { audio: buf, ptt: !!ptt })
-    } else {
-      return res.status(400).json({ ok: false, error: 'unsupported_type' })
-    }
-    return res.json({ ok: true })
-  } catch (e) {
-    const boom = e as Boom
-    const code = (boom as any)?.output?.statusCode || 500
-    logger.error({ id, to: jid, type, err: String(e) })
-    return res.status(502).json({ ok: false, error: 'gateway_send_failed', status: code })
-  }
-})
-
-// Compatibility aliases (try your older probes)
-app.post('/sessions/:id/sendText', requireAuth, (req, res) => {
-  req.body.type = 'text'
-  app._router.handle(req, res, () => {}, 'post', `/sessions/${req.params.id}/messages`)
-})
-app.post('/sessions/:id/sendMessage', requireAuth, (req, res) => {
-  // accept { to, text } as text
-  req.body.type = req.body.type || (req.body.text ? 'text' : undefined)
-  app._router.handle(req, res, () => {}, 'post', `/sessions/${req.params.id}/messages`)
-})
-app.post('/sessions/:id/messages/text', requireAuth, (req, res) => {
-  req.body.type = 'text'
-  app._router.handle(req, res, () => {}, 'post', `/sessions/${req.params.id}/messages`)
-})
-app.post('/sessions/:id/message', requireAuth, (req, res) => {
-  // generic
-  app._router.handle(req, res, () => {}, 'post', `/sessions/${req.params.id}/messages`)
-})
-
+const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
-  logger.info({ app: BROWSER_NAME, port: PORT, authDir: AUTH_DIR, msg: 'Gateway listening' })
-})
+  console.log(`[gateway] listening on :${PORT}`);
+});
