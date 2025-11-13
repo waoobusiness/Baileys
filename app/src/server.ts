@@ -6,7 +6,6 @@ import pino from "pino";
 import fs from "fs-extra";
 import path from "path";
 import { LRUCache } from "lru-cache";
-import { v4 as uuidv4 } from "uuid";
 import { lookup as mimeLookup } from "mime-types";
 import EventEmitter from "eventemitter3";
 import QRCode from "qrcode";
@@ -34,6 +33,10 @@ const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
   path.join(process.cwd(), "sessions");
+
+// 🔄 Webhook (Make / Supabase / autre)
+const WEBHOOK_URL =
+  process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
 // ----------- App
 
@@ -142,6 +145,48 @@ async function clearSessionAuth(orgId: string) {
   }
 }
 
+// ----------- Helper: extraire le texte d’un message
+
+function extractMessageBody(msg: WAMessage): string | undefined {
+  const m: any = msg.message;
+  if (!m) return undefined;
+
+  if (m.conversation) return m.conversation as string;
+  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text as string;
+  if (m.imageMessage?.caption) return m.imageMessage.caption as string;
+  if (m.videoMessage?.caption) return m.videoMessage.caption as string;
+  if (m.buttonsMessage?.contentText)
+    return m.buttonsMessage.contentText as string;
+  if (m.listMessage?.description) return m.listMessage.description as string;
+
+  return undefined;
+}
+
+// ----------- Helper: envoyer vers le webhook externe
+
+async function postWebhook(
+  event: string,
+  orgId: string,
+  payload: any
+): Promise<void> {
+  if (!WEBHOOK_URL) return;
+
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        event,
+        orgId,
+        ts: Date.now(),
+        payload,
+      }),
+    });
+  } catch (err) {
+    logger.error({ err, orgId, event }, "webhook error");
+  }
+}
+
 // Helpers pour normaliser ce qu’on garde en mémoire
 function normalizeChat(raw: any): ChatSummary | null {
   if (!raw || !raw.id) return null;
@@ -179,63 +224,6 @@ function normalizeContact(raw: any): ContactSummary | null {
   const notify = raw.notify;
   const shortName = raw.shortName || raw.name || raw.pushName || name;
   return { id, name, notify, shortName };
-}
-
-// ➕ Helper pour extraire le contenu lisible du message (texte + images + audio, etc.)
-function extractMessageBody(msg: WAMessage): string | undefined {
-  const m = msg.message;
-  if (!m) return undefined;
-
-  // Texte simple
-  if (m.conversation) return m.conversation;
-
-  // Texte enrichi (préviews, replies, etc.)
-  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
-
-  // Images (on prend la légende si présente, sinon placeholder)
-  if (m.imageMessage) {
-    if (m.imageMessage.caption) return m.imageMessage.caption;
-    return "🖼️ Image";
-  }
-
-  // Vidéos (même logique)
-  if (m.videoMessage) {
-    if (m.videoMessage.caption) return m.videoMessage.caption;
-    return "🎥 Vidéo";
-  }
-
-  // Audio (on met un petit placeholder)
-  if (m.audioMessage) {
-    const secs = (m.audioMessage as any).seconds;
-    if (secs) {
-      return `🎧 Audio (${secs}s)`;
-    }
-    return "🎧 Audio";
-  }
-
-  // Documents
-  if (m.documentMessage) {
-    const fileName = m.documentMessage.fileName;
-    return fileName ? `📄 Document: ${fileName}` : "📄 Document";
-  }
-
-  // Stickers
-  if (m.stickerMessage) {
-    return "🟩 Sticker";
-  }
-
-  // Contacts
-  if (m.contactsArrayMessage) {
-    return "👤 Contact";
-  }
-
-  // Localisation
-  if (m.locationMessage || (m.liveLocationMessage as any)) {
-    return "📍 Localisation";
-  }
-
-  // Par défaut on ne met rien si on ne sait pas
-  return undefined;
 }
 
 // ----------- Session bootstrap
@@ -299,6 +287,11 @@ async function startSession(orgId: string): Promise<Session> {
       sess!.qr = null;
       getBus(orgId).emit("status", { type: "connected", user: sock.user });
       logger.info({ orgId }, "WA connected");
+
+      // Webhook: statut connecté
+      void postWebhook("connection.open", orgId, {
+        user: sock.user,
+      });
       return;
     }
 
@@ -325,6 +318,12 @@ async function startSession(orgId: string): Promise<Session> {
       });
 
       logger.warn({ orgId, code, willReconnect }, "WA closed");
+
+      // Webhook: statut fermé
+      void postWebhook("connection.close", orgId, {
+        code,
+        willReconnect,
+      });
 
       if (!willReconnect) {
         // on supprime la session en mémoire & disque
@@ -378,6 +377,9 @@ async function startSession(orgId: string): Promise<Session> {
       chats: Array.from(sess!.chats.values()),
       contacts: Array.from(sess!.contacts.values()),
     });
+
+    // ❗ On NE pousse PAS cet historique vers le webhook
+    // => tu as dit que les anciens historiques ne t’intéressent pas pour le scoring
   });
 
   // Chats & contacts live updates
@@ -403,7 +405,8 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
+      const existing =
+        sess!.chats.get(id) || ({ id } as ChatSummary);
 
       const merged: ChatSummary = {
         ...existing,
@@ -453,7 +456,8 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
+      const existing =
+        sess!.contacts.get(id) || ({ id } as ContactSummary);
 
       const merged: ContactSummary = {
         ...existing,
@@ -474,7 +478,7 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Messages entrants => cache + bus
+  // Messages entrants => cache + bus + webhook (INBOUND uniquement)
   sock.ev.on("messages.upsert", (m: any) => {
     const up = m.messages || [];
     for (const msg of up as WAMessage[]) {
@@ -482,29 +486,44 @@ async function startSession(orgId: string): Promise<Session> {
         sess!.msgCache.set(msg.key.id, msg);
       }
 
-      const body = extractMessageBody(msg); // ➕ on récupère le contenu lisible
+      const messageType = msg.message
+        ? Object.keys(msg.message)[0]
+        : undefined;
+      const body = extractMessageBody(msg);
 
+      const simplified = {
+        id: msg.key.id,
+        from: msg.key.remoteJid,
+        fromMe: msg.key.fromMe,
+        pushName: (msg as any).pushName,
+        timestamp: (msg.messageTimestamp || 0).toString(),
+        messageType,
+        body,
+      };
+
+      // SSE pour Lovable
       getBus(orgId).emit("message", {
         type: "message",
-        message: {
-          id: msg.key.id,
-          from: msg.key.remoteJid,
-          fromMe: msg.key.fromMe,
-          pushName: (msg as any).pushName,
-          timestamp: (msg.messageTimestamp || 0).toString(),
-          messageType: msg.message ? Object.keys(msg.message)[0] : undefined,
-          body, // ➕ texte / caption / placeholder
-        },
+        message: simplified,
       });
+
+      // Webhook uniquement pour les messages entrants (clients → toi)
+      if (!msg.key.fromMe) {
+        void postWebhook("message.incoming", orgId, {
+          ...simplified,
+        });
+      }
     }
   });
 
   sock.ev.on("messages.update", (updates: any) => {
     getBus(orgId).emit("messages.update", updates);
+    void postWebhook("messages.update", orgId, updates);
   });
 
   sock.ev.on("message-receipt.update", (r: any) => {
     getBus(orgId).emit("receipt", r);
+    void postWebhook("message-receipt.update", orgId, r);
   });
 
   return sess;
@@ -714,7 +733,7 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ----------- ENVOI DE MESSAGES
+// ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
 
 app.post("/wa/send/text", async (req: Request, res: Response) => {
   const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
@@ -743,11 +762,13 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
     }
 
     const sent = await s.sock!.sendMessage(jid, content, options);
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+
+    // Webhook: message sortant (via Zuria)
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "text",
+      to: jid,
       key: sent.key,
+      body: String(text),
     });
 
     res.json({ ok: true, key: sent.key });
@@ -777,11 +798,11 @@ app.post("/wa/send/image", async (req: Request, res: Response) => {
 
     const sent = await s.sock!.sendMessage(jid, msg);
 
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "image",
+      to: jid,
       key: sent.key,
+      caption: caption || null,
     });
 
     res.json({ ok: true, key: sent.key });
@@ -819,11 +840,12 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
 
     const sent = await s.sock!.sendMessage(jid, msg);
 
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "document",
+      to: jid,
       key: sent.key,
+      fileName: fileName || "file",
+      mimetype: mimetype || null,
     });
 
     res.json({ ok: true, key: sent.key });
@@ -853,11 +875,11 @@ app.post("/wa/send/audio", async (req: Request, res: Response) => {
 
     const sent = await s.sock!.sendMessage(jid, msg);
 
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "audio",
+      to: jid,
       key: sent.key,
+      ptt: Boolean(ptt),
     });
 
     res.json({ ok: true, key: sent.key });
@@ -896,11 +918,11 @@ app.post("/wa/send/buttons", async (req: Request, res: Response) => {
 
     const sent = await s.sock!.sendMessage(jid, msg);
 
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "buttons",
+      to: jid,
       key: sent.key,
+      text,
     });
 
     res.json({ ok: true, key: sent.key });
@@ -942,11 +964,12 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
 
     const sent = await s.sock!.sendMessage(jid, msg);
 
-    getBus(String(orgId)).emit("custom", {
-      type: "message_sent",
-      to: jid,
+    void postWebhook("message.outgoing", String(orgId), {
       kind: "list",
+      to: jid,
       key: sent.key,
+      title,
+      text,
     });
 
     res.json({ ok: true, key: sent.key });
@@ -969,13 +992,14 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
   const out: any[] = [];
 
   s.msgCache.forEach((msg, id) => {
+    const body = extractMessageBody(msg);
     out.push({
       id,
       from: msg.key.remoteJid,
       fromMe: msg.key.fromMe,
       timestamp: (msg.messageTimestamp || 0).toString(),
       type: msg.message ? Object.keys(msg.message)[0] : undefined,
-      body: extractMessageBody(msg), // ➕ on renvoie aussi le contenu
+      body,
     });
   });
 
