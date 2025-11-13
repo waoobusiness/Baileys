@@ -1,171 +1,207 @@
-// server.ts - Gateway WhatsApp (Render)
-// npm i express cors eventemitter3 uuid @whiskeysockets/baileys
-import express from "express";
-import cors from "cors";
-import { EventEmitter } from "eventemitter3";
-import { v4 as uuid } from "uuid";
-// import { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } from "@whiskeysockets/baileys";
+import express, { Request, Response } from "express"
+import cors from "cors"
+import { EventEmitter } from "node:events"
+import { randomUUID } from "node:crypto"
+import http from "node:http"
 
-const app = express();
-app.use(express.json());
-app.use(cors({ origin: process.env.CORS_ALLOW_ORIGIN?.split(",") ?? ["*"] }));
+// ──────────────────────────────────────────────────────────────────────────────
+// Types
+// ──────────────────────────────────────────────────────────────────────────────
+type OrgId = string
 
-// --- Sécurité simple entre Edge Function et Gateway ---
-const EDGE_TOKEN = process.env.EDGE_TOKEN || "";
-function requireEdgeToken(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const t = req.header("x-edge-token");
-  if (!EDGE_TOKEN || t === EDGE_TOKEN) return next();
-  return res.status(401).json({ ok: false, error: "unauthorized" });
+type EventType = "status" | "qr" | "connection_info" | "error" | "log" | "custom"
+
+interface InboundEvent {
+  orgId: OrgId
+  type: EventType
+  data?: unknown
 }
 
-// --- Mémoire: sessions, locks, bus SSE ---
-type Session = {
-  orgId: string;
-  sessionId: string;
-  status: "pending" | "qr" | "connected" | "error";
-  events: EventEmitter;
-  startedAt: number;
-  // sock?: ReturnType<typeof makeWASocket>;
-  starting: boolean;
-};
-const sessions = new Map<string, Session>();       // key: sessionId
-const orgToSession = new Map<string, string>();    // key: orgId -> sessionId
-const startingOrgs = new Set<string>();            // simple lock anti-doublon
-
-// --- Helpers SSE ---
-function sseHeaders() {
-  return {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    // Optionnel: pour proxies
-    "X-Accel-Buffering": "no",
-  };
-}
-function sseWrite(res: express.Response, event: string, data: any) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+interface Client {
+  id: string
+  res: Response
 }
 
-// --- Boot / Reuse d'une session ---
-async function startOrReuseSession(orgId: string): Promise<Session> {
-  // Si on a déjà une session active pour cet org, on la renvoie
-  const existingId = orgToSession.get(orgId);
-  if (existingId) {
-    const s = sessions.get(existingId);
-    if (s) return s;
-    orgToSession.delete(orgId);
+const app = express()
+app.use(cors())
+app.use(express.json({ limit: "1mb" }))
+
+const PORT = Number(process.env.PORT || 3000)
+
+// ──────────────────────────────────────────────────────────────────────────────
+/**
+ * Multi-tenant event bus :
+ *  - Un EventEmitter par orgId
+ *  - Une liste de clients SSE (Response) par orgId
+ */
+const orgBuses = new Map<OrgId, EventEmitter>()
+const orgClients = new Map<OrgId, Set<Client>>()
+
+function getBus(orgId: OrgId): EventEmitter {
+  let bus = orgBuses.get(orgId)
+  if (!bus) {
+    bus = new EventEmitter()
+    bus.setMaxListeners(1000)
+    orgBuses.set(orgId, bus)
   }
-
-  // Lock anti-démarrage concurrent
-  if (startingOrgs.has(orgId)) {
-    // On attend que l'autre boucle finisse (polling soft)
-    await new Promise((r) => setTimeout(r, 500));
-    const again = orgToSession.get(orgId);
-    if (again && sessions.get(again)) return sessions.get(again)!;
-  }
-
-  startingOrgs.add(orgId);
-  try {
-    const sessionId = `org_${orgId}__ephem_${Date.now()}_${uuid().slice(0, 8)}`;
-    const events = new EventEmitter();
-
-    const session: Session = {
-      orgId, sessionId, events,
-      status: "pending",
-      startedAt: Date.now(),
-      starting: true,
-    };
-    sessions.set(sessionId, session);
-    orgToSession.set(orgId, sessionId);
-
-    // --- Ici on boot Baileys (ex: en single-file auth en mémoire ou disque)
-    // const { state, saveCreds } = await useMultiFileAuthState(`./auth/${sessionId}`);
-    // const sock = makeWASocket({
-    //   auth: state,
-    //   browser: Browsers.macOS("Zuria.AI"),
-    //   printQRInTerminal: false,
-    //   syncFullHistory: false,
-    // });
-    // session.sock = sock;
-
-    // sock.ev.on("creds.update", saveCreds);
-    // sock.ev.on("connection.update", (u) => {
-    //   const { connection, lastDisconnect, qr } = u;
-    //   if (qr) {
-    //     session.status = "qr";
-    //     events.emit("qr", { qr });
-    //   }
-    //   if (connection === "open") {
-    //     session.status = "connected";
-    //     events.emit("status", { status: "connected" });
-    //   }
-    //   if (connection === "close") {
-    //     const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-    //     events.emit("status", { status: "closed", reason });
-    //   }
-    // });
-
-    // --- DEMO: sans Baileys branché, on simule un QR puis "connected"
-    setTimeout(() => { session.status = "qr"; events.emit("qr", { qr: "qr-data-demo" }); }, 1200);
-    setTimeout(() => { session.status = "connected"; events.emit("status", { status: "connected" }); }, 6000);
-
-    session.starting = false;
-    return session;
-  } finally {
-    startingOrgs.delete(orgId);
-  }
+  return bus
 }
 
-// --- API: créer / récupérer une session depuis org_id ---
-app.post("/sessions", requireEdgeToken, async (req, res) => {
-  const orgId = String(req.query.org_id ?? req.body?.org_id ?? "").trim();
-  if (!orgId) return res.status(400).json({ ok: false, error: "org_id_required" });
-
-  try {
-    const s = await startOrReuseSession(orgId);
-    return res.json({ ok: true, session_id: s.sessionId });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: "session_start_failed", details: String(e?.message || e) });
+function getClients(orgId: OrgId): Set<Client> {
+  let set = orgClients.get(orgId)
+  if (!set) {
+    set = new Set<Client>()
+    orgClients.set(orgId, set)
   }
-});
+  return set
+}
 
-// --- SSE: stream des événements de la session ---
-app.get("/sessions/:sessionId/events", requireEdgeToken, (req, res) => {
-  const { sessionId } = req.params;
-  const s = sessions.get(sessionId);
-  if (!s) return res.status(404).send("session_not_found");
+// ──────────────────────────────────────────────────────────────────────────────
+// SSE helpers
+// ──────────────────────────────────────────────────────────────────────────────
+function sseHeaders(res: Response) {
+  res.setHeader("Content-Type", "text/event-stream")
+  res.setHeader("Cache-Control", "no-cache, no-transform")
+  res.setHeader("Connection", "keep-alive")
+  res.setHeader("X-Accel-Buffering", "no") // utile sur certains proxies
+  res.flushHeaders?.()
+}
 
-  res.writeHead(200, sseHeaders());
+function sseSend(res: Response, event: string, data: unknown) {
+  // Pas d'objets circulaires
+  const payload = typeof data === "string" ? data : JSON.stringify(data ?? {})
+  res.write(`event: ${event}\n`)
+  res.write(`data: ${payload}\n\n`)
+}
 
-  // bootstrap: envoyer l'état courant
-  sseWrite(res, "status", { status: s.status, sessionId });
+function ssePing(res: Response) {
+  res.write(`event: ping\n`)
+  res.write(`data: "💓"\n\n`)
+}
 
-  // listeners
-  const onQR = (payload: any) => sseWrite(res, "qr", { ...payload, sessionId });
-  const onStatus = (payload: any) => sseWrite(res, "status", { ...payload, sessionId });
-  const onError = (payload: any) => sseWrite(res, "error", { ...payload, sessionId });
+// ──────────────────────────────────────────────────────────────────────────────
+// Health
+// ──────────────────────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    orgs: [...orgBuses.keys()].length,
+    clients: [...orgClients.values()].reduce((acc, set) => acc + set.size, 0)
+  })
+})
 
-  s.events.on("qr", onQR);
-  s.events.on("status", onStatus);
-  s.events.on("error", onError);
+// ──────────────────────────────────────────────────────────────────────────────
+// SSE endpoint — /sse?org_id=xxx
+// Remplace l'ancien proxy "wa-sse-proxy" si besoin.
+// ──────────────────────────────────────────────────────────────────────────────
+app.get("/sse", (req: Request, res: Response) => {
+  const orgId = (req.query.org_id as string) || (req.query.orgId as string)
+  if (!orgId) {
+    res.status(400).json({ ok: false, error: "Missing org_id" })
+    return
+  }
 
-  // keepalive every 25s
-  const ka = setInterval(() => res.write(": keep-alive\n\n"), 25_000);
+  sseHeaders(res)
+  const clientId = randomUUID()
+  const clients = getClients(orgId)
+  clients.add({ id: clientId, res })
+
+  // Message d’accueil
+  sseSend(res, "welcome", { clientId, orgId, at: new Date().toISOString() })
+
+  const bus = getBus(orgId)
+  const onStatus = (data: unknown) => sseSend(res, "status", data)
+  const onQR = (data: unknown) => sseSend(res, "qr", data)
+  const onConn = (data: unknown) => sseSend(res, "connection_info", data)
+  const onErr = (data: unknown) => sseSend(res, "error", data)
+  const onLog = (data: unknown) => sseSend(res, "log", data)
+  const onCustom = (data: unknown) => sseSend(res, "custom", data)
+
+  bus.on("status", onStatus)
+  bus.on("qr", onQR)
+  bus.on("connection_info", onConn)
+  bus.on("error", onErr)
+  bus.on("log", onLog)
+  bus.on("custom", onCustom)
+
+  // Heartbeat pour garder la connexion en vie (proxy/Render)
+  const heartbeat = setInterval(() => ssePing(res), 15000)
 
   req.on("close", () => {
-    clearInterval(ka);
-    s.events.off("qr", onQR);
-    s.events.off("status", onStatus);
-    s.events.off("error", onError);
-    res.end();
-  });
-});
+    clearInterval(heartbeat)
+    bus.off("status", onStatus)
+    bus.off("qr", onQR)
+    bus.off("connection_info", onConn)
+    bus.off("error", onErr)
+    bus.off("log", onLog)
+    bus.off("custom", onCustom)
 
-// --- Santé & debug ---
-app.get("/healthz", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+    const set = getClients(orgId)
+    for (const c of set) if (c.id === clientId) set.delete(c)
+  })
+})
 
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => {
-  console.log(`[gateway] listening on :${PORT}`);
-});
+// ──────────────────────────────────────────────────────────────────────────────
+/**
+ * Ingress events — POST /events
+ * Permet à vos workers (WhatsApp/Baileys, webhooks, cron) d’émettre vers l’SSE.
+ * Body: { orgId: string, type: "status"|"qr"|..., data?: any }
+ */
+app.post("/events", (req: Request<unknown, unknown, InboundEvent>, res: Response) => {
+  const { orgId, type, data } = req.body || {}
+  if (!orgId) return res.status(400).json({ ok: false, error: "Missing orgId" })
+  if (!type) return res.status(400).json({ ok: false, error: "Missing type" })
+
+  const bus = getBus(orgId)
+  bus.emit(type, data ?? {})
+
+  res.json({ ok: true })
+})
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Utilitaires debug (à retirer en prod si besoin)
+// GET /debug/emit?org_id=xxx&type=status&data=connected
+// ──────────────────────────────────────────────────────────────────────────────
+app.get("/debug/emit", (req, res) => {
+  const orgId = (req.query.org_id as string) || (req.query.orgId as string)
+  const type = (req.query.type as EventType) || "log"
+  const raw = req.query.data
+  let data: unknown = raw
+
+  try {
+    if (typeof raw === "string" && (raw.startsWith("{") || raw.startsWith("["))) {
+      data = JSON.parse(raw)
+    }
+  } catch {
+    // keep raw string
+  }
+
+  if (!orgId) return res.status(400).json({ ok: false, error: "Missing org_id" })
+  getBus(orgId).emit(type, data ?? { ok: true, note: "no data" })
+
+  res.json({ ok: true, sent: { orgId, type, data } })
+})
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Server
+// ──────────────────────────────────────────────────────────────────────────────
+const server = http.createServer(app)
+
+server.listen(PORT, () => {
+  console.log(`[server] listening on :${PORT}`)
+})
+
+// Graceful shutdown
+function shutdown(signal: NodeJS.Signals) {
+  console.log(`[server] ${signal} received, shutting down…`)
+  server.close(() => {
+    console.log("[server] closed")
+    process.exit(0)
+  })
+  // Force exit si quelque chose bloque
+  setTimeout(() => process.exit(1), 5000).unref()
+}
+
+process.on("SIGINT", shutdown)
+process.on("SIGTERM", shutdown)
