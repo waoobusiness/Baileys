@@ -46,6 +46,22 @@ app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 type SessionStatus = "starting" | "qr" | "connecting" | "connected" | "closed";
 
+type ChatSummary = {
+  id: string;
+  name?: string;
+  unreadCount?: number;
+  lastMessageTimestamp?: number;
+  lastMessagePreview?: string;
+  isGroup?: boolean;
+};
+
+type ContactSummary = {
+  id: string;
+  name?: string;
+  notify?: string;
+  shortName?: string;
+};
+
 type Session = {
   orgId: string;
   sock?: WASocket;
@@ -54,20 +70,28 @@ type Session = {
   qr?: string | null;
   status: SessionStatus;
   msgCache: LRUCache<string, WAMessage>;
+  chats: Map<string, ChatSummary>;
+  contacts: Map<string, ContactSummary>;
 };
 
 const sessions = new Map<string, Session>();
 
+function createEmptySession(orgId: string): Session {
+  return {
+    orgId,
+    bus: new EventEmitter(),
+    status: "closed",
+    qr: null,
+    msgCache: new LRUCache({ max: 1000 }),
+    chats: new Map(),
+    contacts: new Map(),
+  };
+}
+
 function getBus(orgId: string): EventEmitter {
   let s = sessions.get(orgId);
   if (!s) {
-    s = {
-      orgId,
-      bus: new EventEmitter(),
-      status: "closed",
-      qr: null,
-      msgCache: new LRUCache({ max: 1000 }),
-    };
+    s = createEmptySession(orgId);
     sessions.set(orgId, s);
   }
   return s.bus;
@@ -118,10 +142,51 @@ async function clearSessionAuth(orgId: string) {
   }
 }
 
+// Helpers pour normaliser ce qu’on garde en mémoire
+function normalizeChat(raw: any): ChatSummary | null {
+  if (!raw || !raw.id) return null;
+  const id = raw.id as string;
+  const isGroup = id.endsWith("@g.us");
+  const name =
+    raw.name || raw.subject || raw.pushName || raw.formattedName || id;
+  const lastMessageTimestamp = Number(
+    raw.conversationTimestamp ||
+      raw.lastMessageRecv?.messageTimestamp ||
+      raw.t ||
+      0
+  );
+  const lastMessagePreview =
+    raw.lastMessage?.conversation ||
+    raw.lastMessage?.message?.conversation ||
+    raw.lastMessage?.msg ||
+    undefined;
+  const unreadCount = raw.unreadCount;
+
+  return {
+    id,
+    name,
+    unreadCount,
+    lastMessageTimestamp,
+    lastMessagePreview,
+    isGroup,
+  };
+}
+
+function normalizeContact(raw: any): ContactSummary | null {
+  if (!raw || !raw.id) return null;
+  const id = raw.id as string;
+  const name = raw.name || raw.notify || raw.pushName || id;
+  const notify = raw.notify;
+  const shortName = raw.shortName || raw.name || raw.pushName || name;
+  return { id, name, notify, shortName };
+}
+
 // ----------- Session bootstrap
 
 async function startSession(orgId: string): Promise<Session> {
   let sess = sessions.get(orgId);
+
+  // Si déjà connecté, on renvoie
   if (sess?.sock && sess.status === "connected") {
     return sess;
   }
@@ -132,14 +197,9 @@ async function startSession(orgId: string): Promise<Session> {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  sess =
-    sessions.get(orgId) || ({
-      orgId,
-      bus: new EventEmitter(),
-      status: "starting",
-      qr: null,
-      msgCache: new LRUCache({ max: 1000 }),
-    } as Session);
+  if (!sess) {
+    sess = createEmptySession(orgId);
+  }
 
   sessions.set(orgId, sess);
 
@@ -152,6 +212,9 @@ async function startSession(orgId: string): Promise<Session> {
     },
     browser: ["Zuria", "Chrome", "1.0.0"],
     logger,
+    // pour avoir plus d’historique au premier connect
+    syncFullHistory: true,
+    markOnlineOnConnect: false,
   });
 
   sess.sock = sock;
@@ -163,7 +226,7 @@ async function startSession(orgId: string): Promise<Session> {
   sock.ev.on("creds.update", saveCreds);
 
   // Événements de connexion
-  sock.ev.on("connection.update", (u) => {
+  sock.ev.on("connection.update", (u: any) => {
     const { connection, lastDisconnect, qr } = u;
 
     // QR reçu
@@ -179,41 +242,185 @@ async function startSession(orgId: string): Promise<Session> {
       sess!.qr = null;
       getBus(orgId).emit("status", { type: "connected", user: sock.user });
       logger.info({ orgId }, "WA connected");
+      return;
     }
 
     // Fermé
     if (connection === "close") {
-      const code =
+      const code: number =
         (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
 
-      // Codes qu’on considère comme "non récupérables" => on efface l’auth
-      // - 401 : logged out / invalid session
-      // - 403 : forbidden / banned
-      // - 428 : "Connection Closed" (ex: logout quand c’est déjà fermé)
-      const unrecoverableCodes = [401, 403, 428];
+      // Codes qu’on considère comme "non récupérables"
+      const fatalCodes: number[] = [
+        DisconnectReason.loggedOut, // 401
+        DisconnectReason.forbidden, // 403
+        DisconnectReason.badSession,
+        DisconnectReason.connectionReplaced, // 410
+      ];
 
-      const willReconnect = !unrecoverableCodes.includes(code);
+      const willReconnect = !fatalCodes.includes(code);
 
       sess!.status = "closed";
-      getBus(orgId).emit("status", { type: "closed", code, willReconnect });
+      getBus(orgId).emit("status", {
+        type: "closed",
+        code,
+        willReconnect,
+      });
 
       logger.warn({ orgId, code, willReconnect }, "WA closed");
 
       if (!willReconnect) {
-        // On supprime la session en mémoire et sur disque
+        // on supprime la session en mémoire & disque
         sessions.delete(orgId);
         clearSessionAuth(orgId).catch(() => {});
       } else {
-        // Si un jour tu veux auto-reconnecter sur des codes "safe", tu peux décommenter :
-        // setTimeout(() => startSession(orgId).catch(() => {}), 2000);
+        // 🔁 cas 515 / restartRequired & co → on relance la session avec les mêmes creds
+        setTimeout(() => {
+          logger.info({ orgId, code }, "auto-restart WA session");
+          startSession(orgId).catch((err) =>
+            logger.error({ err, orgId }, "failed to restart session")
+          );
+        }, 1000);
       }
     }
   });
 
+  // Historique initial (chats, contacts, messages)
+  sock.ev.on("messaging-history.set", (payload: any) => {
+    const { chats, contacts, messages, syncType } = payload || {};
+
+    if (Array.isArray(chats)) {
+      for (const c of chats) {
+        const summary = normalizeChat(c);
+        if (summary) {
+          sess!.chats.set(summary.id, summary);
+        }
+      }
+    }
+
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        const summary = normalizeContact(c);
+        if (summary) {
+          sess!.contacts.set(summary.id, summary);
+        }
+      }
+    }
+
+    if (Array.isArray(messages)) {
+      for (const msg of messages as WAMessage[]) {
+        if (msg.key && msg.key.id) {
+          sess!.msgCache.set(msg.key.id, msg);
+        }
+      }
+    }
+
+    getBus(orgId).emit("history", {
+      type: "set",
+      syncType,
+      chats: Array.from(sess!.chats.values()),
+      contacts: Array.from(sess!.contacts.values()),
+    });
+  });
+
+  // Chats & contacts live updates
+  sock.ev.on("chats.upsert", (up: any) => {
+    const arr = Array.isArray(up) ? up : up?.chats || [];
+    const updated: ChatSummary[] = [];
+
+    for (const c of arr) {
+      const summary = normalizeChat(c);
+      if (summary) {
+        sess!.chats.set(summary.id, summary);
+        updated.push(summary);
+      }
+    }
+
+    if (updated.length) {
+      getBus(orgId).emit("chats", { type: "upsert", chats: updated });
+    }
+  });
+
+  sock.ev.on("chats.update", (updates: any) => {
+    const updated: ChatSummary[] = [];
+
+    for (const u of updates || []) {
+      const id = u.id as string;
+      const existing = sess!.chats.get(id) || { id } as ChatSummary;
+
+      const merged: ChatSummary = {
+        ...existing,
+        unreadCount:
+          u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
+        lastMessageTimestamp:
+          u.conversationTimestamp !== undefined
+            ? Number(u.conversationTimestamp)
+            : existing.lastMessageTimestamp,
+      };
+
+      if (u.name || u.subject) {
+        merged.name = u.name || u.subject;
+      }
+
+      sess!.chats.set(id, merged);
+      updated.push(merged);
+    }
+
+    if (updated.length) {
+      getBus(orgId).emit("chats", { type: "update", chats: updated });
+    }
+  });
+
+  sock.ev.on("contacts.upsert", (up: any) => {
+    const arr = Array.isArray(up) ? up : up?.contacts || [];
+    const updated: ContactSummary[] = [];
+
+    for (const c of arr) {
+      const summary = normalizeContact(c);
+      if (summary) {
+        sess!.contacts.set(summary.id, summary);
+        updated.push(summary);
+      }
+    }
+
+    if (updated.length) {
+      getBus(orgId).emit("contacts", {
+        type: "upsert",
+        contacts: updated,
+      });
+    }
+  });
+
+  sock.ev.on("contacts.update", (updates: any) => {
+    const updated: ContactSummary[] = [];
+
+    for (const u of updates || []) {
+      const id = u.id as string;
+      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
+
+      const merged: ContactSummary = {
+        ...existing,
+        name: u.name || u.notify || existing.name,
+        notify: u.notify ?? existing.notify,
+        shortName: u.shortName ?? existing.shortName,
+      };
+
+      sess!.contacts.set(id, merged);
+      updated.push(merged);
+    }
+
+    if (updated.length) {
+      getBus(orgId).emit("contacts", {
+        type: "update",
+        contacts: updated,
+      });
+    }
+  });
+
   // Messages entrants => cache + bus
-  sock.ev.on("messages.upsert", (m) => {
+  sock.ev.on("messages.upsert", (m: any) => {
     const up = m.messages || [];
-    for (const msg of up) {
+    for (const msg of up as WAMessage[]) {
       if (msg.key && msg.key.id) {
         sess!.msgCache.set(msg.key.id, msg);
       }
@@ -231,11 +438,11 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  sock.ev.on("messages.update", (updates) => {
+  sock.ev.on("messages.update", (updates: any) => {
     getBus(orgId).emit("messages.update", updates);
   });
 
-  sock.ev.on("message-receipt.update", (r) => {
+  sock.ev.on("message-receipt.update", (r: any) => {
     getBus(orgId).emit("receipt", r);
   });
 
@@ -278,15 +485,31 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     send("qr", { qr: s.qr, svg: qrSvg });
   }
 
+  // Si on a déjà de l’historique en mémoire, on l’envoie une fois
+  if (s && (s.chats.size || s.contacts.size)) {
+    send("history", {
+      type: "set",
+      syncType: "initial",
+      chats: Array.from(s.chats.values()),
+      contacts: Array.from(s.contacts.values()),
+    });
+  }
+
   const onStatus = (data: any) => send("status", data);
   const onMessage = (data: any) => send("message", data);
   const onUpdate = (data: any) => send("messages.update", data);
   const onReceipt = (data: any) => send("receipt", data);
+  const onHistory = (data: any) => send("history", data);
+  const onChats = (data: any) => send("chats", data);
+  const onContacts = (data: any) => send("contacts", data);
 
   bus.on("status", onStatus);
   bus.on("message", onMessage);
   bus.on("messages.update", onUpdate);
   bus.on("receipt", onReceipt);
+  bus.on("history", onHistory);
+  bus.on("chats", onChats);
+  bus.on("contacts", onContacts);
 
   const interval = setInterval(() => {
     res.write(": keep-alive\n\n");
@@ -298,6 +521,9 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     bus.off("message", onMessage);
     bus.off("messages.update", onUpdate);
     bus.off("receipt", onReceipt);
+    bus.off("history", onHistory);
+    bus.off("chats", onChats);
+    bus.off("contacts", onContacts);
   });
 });
 
@@ -352,6 +578,56 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
 
   const svg = await QRCode.toString(s.qr, { type: "svg" });
   res.json({ ok: true, qr: s.qr, svg });
+});
+
+// ➕ Bootstrap : renvoyer les dernières conversations + contacts
+app.get("/wa/bootstrap", async (req: Request, res: Response) => {
+  const orgId = String(req.query.orgId || "");
+  const limit = Number(req.query.limit || 20);
+
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
+
+  const s = sessions.get(orgId);
+  if (!s) {
+    return res.status(404).json({ ok: false, error: "No session" });
+  }
+
+  const chats = Array.from(s.chats.values()).sort(
+    (a, b) =>
+      (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
+  );
+
+  const contacts = Array.from(s.contacts.values());
+
+  res.json({
+    ok: true,
+    chats: chats.slice(0, limit),
+    contacts,
+  });
+});
+
+// ➕ Avatar à la demande
+app.get("/wa/profile-picture", async (req: Request, res: Response) => {
+  const orgId = String(req.query.orgId || "");
+  const jid = String(req.query.jid || "");
+  if (!orgId || !jid) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,jid required" });
+  }
+
+  const s = getSessionOr404(orgId, res);
+  if (!s) return;
+
+  try {
+    const url = await s.sock!.profilePictureUrl(jid, "image");
+    res.json({ ok: true, url: url || null });
+  } catch (err) {
+    logger.warn({ err, orgId, jid }, "profile picture error");
+    res.json({ ok: true, url: null });
+  }
 });
 
 app.post("/wa/logout", async (req: Request, res: Response) => {
