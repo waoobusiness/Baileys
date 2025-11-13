@@ -2,24 +2,20 @@ services:
   - type: web
     name: zuria-wa
     env: node
-    rootDir: app
-    plan: free
-    region: frankfurt
-    buildCommand: |
-      npm ci
-      npm run build
-    startCommand: node dist/server.js
-    autoDeploy: true
+    plan: starter
+    buildCommand: "npm install && npm run build"
+    startCommand: "npm start"
     envVars:
       - key: NODE_VERSION
-        value: 20.19.5
-      - key: PORT
-        value: 10000
-      # tes autres variables (AUTH_TOKEN, etc.)
-      # - key: AUTH_TOKEN
-      #   sync: false
-    healthCheckPath: /health
-    disk:
-      name: baileys-auth
-      mountPath: /opt/render/project/src/app/.baileys_auth
-      sizeGB: 1
+        value: 20
+      - key: AUTH_TOKEN
+        sync: false
+      - key: AUTH_DIR
+        value: .baileys_auth
+      - key: WEBHOOK_BASE
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: BROWSER_NAME
+        value: "Zuria.AI"
+    healthCheckPath: "/health"
