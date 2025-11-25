@@ -151,9 +151,29 @@ async function clearSessionAuth(orgId: string) {
 
 // ----------- Helpers divers
 
+// ✅ NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
-  const digits = jid.replace(/[^\d]/g, "");
+
+  const [local, domain] = jid.split("@");
+  if (!local) return null;
+
+  // Cas à ignorer pour le "numéro" :
+  // - LID (identifiants internes Business / multi-device)
+  // - groupes
+  // - status / broadcast / newsletters
+  // - JID contenant un "-" (souvent groupes)
+  if (
+    domain === "lid" ||
+    domain === "g.us" ||
+    domain === "newsletter" ||
+    local === "status" ||
+    local.includes("-")
+  ) {
+    return null;
+  }
+
+  const digits = local.replace(/[^\d]/g, "");
   return digits || null;
 }
 
@@ -224,14 +244,16 @@ function buildZapiLikeMessage(
 ): any {
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
-  const phone = jidToPhone(msg.key.remoteJid as string);
-  const isGroup = (msg.key.remoteJid || "").endsWith("@g.us");
+
+  const remoteJid = msg.key.remoteJid as string | undefined;
+  const phone = jidToPhone(remoteJid || "");
+  const isGroup = (remoteJid || "").endsWith("@g.us");
   const fromMe = !!msg.key.fromMe;
   const tsSec = Number(msg.messageTimestamp || 0) || 0;
   const tsMs = tsSec * 1000;
 
   const contact =
-    sess.contacts.get(msg.key.remoteJid || "") ||
+    (remoteJid && sess.contacts.get(remoteJid)) ||
     (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
 
   const displayName =
@@ -239,7 +261,7 @@ function buildZapiLikeMessage(
     contact?.shortName ||
     (msg as any).pushName ||
     phone ||
-    msg.key.remoteJid;
+    remoteJid;
 
   const base: any = {
     isStatusReply: false,
@@ -251,7 +273,10 @@ function buildZapiLikeMessage(
     isNewsletter: false,
     instanceId: orgId,
     messageId: msg.key.id,
-    phone,
+    // ✅ on ajoute explicitement ces 2 champs pour Supabase / Lovable
+    remoteJid: remoteJid || null,
+    chatId: remoteJid || null,
+    phone, // peut être null pour @lid / groupes
     fromMe,
     momment: tsMs,
     status: fromMe ? "SENT" : "RECEIVED",
