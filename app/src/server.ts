@@ -430,19 +430,20 @@ async function startSession(orgId: string): Promise<Session> {
 
   sessions.set(orgId, sess);
 
-  const sock = makeWASocket({
-    version,
-    printQRInTerminal: false,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    browser: ["Zuria", "Chrome", "1.0.0"],
-    logger,
-    // pour avoir plus d’historique au premier connect
-    syncFullHistory: true,
-    markOnlineOnConnect: false,
-  });
+ const sock = makeWASocket({
+  version,
+  printQRInTerminal: false,
+  auth: {
+    creds: state.creds,
+    keys: makeCacheableSignalKeyStore(state.keys, logger),
+  },
+  browser: ["Zuria", "Chrome", "1.0.0"],
+  logger,
+  // on ne demande PAS l'historique complet, ça réduit la charge et la phase "AwaitingInitialSync"
+  syncFullHistory: false,
+  markOnlineOnConnect: false,
+});
+
 
   sess.sock = sock;
   sess.saveCreds = saveCreds;
