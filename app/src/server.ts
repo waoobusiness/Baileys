@@ -1,4 +1,4 @@
-// src/server.ts
+// app/src/server.ts
 
 import express, { Request, Response } from "express";
 import cors from "cors";
@@ -7,9 +7,10 @@ import fs from "fs-extra";
 import path from "path";
 import { LRUCache } from "lru-cache";
 import { lookup as mimeLookup } from "mime-types";
-import EventEmitter from "eventemitter3";
+import { EventEmitter } from "events";
 import QRCode from "qrcode";
 
+// Baileys v7
 import makeWASocket, {
   WASocket,
   useMultiFileAuthState,
@@ -21,34 +22,34 @@ import makeWASocket, {
   downloadMediaMessage,
 } from "@whiskeysockets/baileys";
 
-// ------------------------ Logger & Config ------------------------
-
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// ----------- Config
 
 const PORT = Number(process.env.PORT || 3000);
 
-// Dossier d'auth par organisation
+// ✅ On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
   path.join(process.cwd(), "sessions");
 
-// URL webhook (Supabase / Make / autre)
+// 🔄 Webhook (Make / Supabase / autre)
 const WEBHOOK_URL =
   process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
-// URL publique pour exposer les médias
+// 🌍 URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL =
   process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
-// ------------------------ Express App ------------------------
+// ----------- App
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// ------------------------ Types & Stores ------------------------
+// ----------- Types & Stores
 
 type SessionStatus = "starting" | "qr" | "connecting" | "connected" | "closed";
 
@@ -68,13 +69,11 @@ type ContactSummary = {
   shortName?: string;
 };
 
-type EventBus = InstanceType<typeof EventEmitter>;
-
 type Session = {
   orgId: string;
   sock?: WASocket;
   saveCreds?: () => Promise<void>;
-  bus: EventBus;
+  bus: EventEmitter;
   qr?: string | null;
   status: SessionStatus;
   msgCache: LRUCache<string, WAMessage>;
@@ -84,12 +83,10 @@ type Session = {
 
 const sessions = new Map<string, Session>();
 
-// ------------------------ Helper: Session & Bus ------------------------
-
 function createEmptySession(orgId: string): Session {
   return {
     orgId,
-    bus: new EventEmitter() as EventBus,
+    bus: new EventEmitter(),
     status: "closed",
     qr: null,
     msgCache: new LRUCache({ max: 1000 }),
@@ -98,7 +95,7 @@ function createEmptySession(orgId: string): Session {
   };
 }
 
-function getBus(orgId: string): EventBus {
+function getBus(orgId: string): EventEmitter {
   let s = sessions.get(orgId);
   if (!s) {
     s = createEmptySession(orgId);
@@ -107,29 +104,13 @@ function getBus(orgId: string): EventBus {
   return s.bus;
 }
 
-function getSessionOr404(orgId: string, res: Response): Session | null {
-  const s = sessions.get(orgId);
-  if (!s || !s.sock?.user) {
-    res.status(400).json({ ok: false, error: "Session not connected" });
-    return null;
-  }
-  return s;
-}
-
-// ------------------------ Helpers de JID / Phone ------------------------
-
 function phoneToJid(to: string): string {
   const digits = to.replace(/[^\d]/g, "").replace(/^00/, "");
   return `${digits}@s.whatsapp.net`;
 }
 
-/**
- * Transforme un JID (PN ou autre) en numéro de téléphone si possible.
- * On ignore volontairement:
- * - LIDs (domain === "lid")
- * - groupes (@g.us)
- * - status, newsletters, JID contenant un "-"
- */
+// ✅ on ne tente plus de transformer les LIDs en numéros de téléphone
+// → si domain === "lid" on renvoie null
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
@@ -150,46 +131,12 @@ function jidToPhone(jid?: string | null): string | null {
   return digits || null;
 }
 
-/**
- * Numéro de téléphone du compte connecté (notre instance)
- */
 function getConnectedPhone(sess: Session): string | null {
   const jid = sess.sock?.user?.id; // ex: "41782640976:52@s.whatsapp.net"
   if (!jid) return null;
   const main = jid.split(":")[0];
   const digits = main.replace(/[^\d]/g, "");
   return digits || null;
-}
-
-// ------------------------ Helpers divers ------------------------
-
-async function bufferFromInput(input?: { url?: string; base64?: string }) {
-  if (!input) return undefined;
-
-  if (input.base64) {
-    const comma = input.base64.indexOf(",");
-    const b64 = comma >= 0 ? input.base64.slice(comma + 1) : input.base64;
-    return Buffer.from(b64, "base64");
-  }
-
-  if (input.url) {
-    const r = await fetch(input.url);
-    if (!r.ok) throw new Error(`fetch failed ${r.status}`);
-    const arr = await r.arrayBuffer();
-    return Buffer.from(arr);
-  }
-
-  return undefined;
-}
-
-async function clearSessionAuth(orgId: string) {
-  const authDir = path.join(SESSIONS_DIR, orgId);
-  try {
-    await fs.remove(authDir);
-    logger.info({ orgId, authDir }, "cleared auth directory");
-  } catch (err) {
-    logger.error({ err, orgId, authDir }, "failed clearing auth directory");
-  }
 }
 
 function buildMediaUrl(orgId: string, msgId: string): string | null {
@@ -200,7 +147,7 @@ function buildMediaUrl(orgId: string, msgId: string): string | null {
   )}`;
 }
 
-// ------------------------ Extraction du texte ------------------------
+// ----------- Helper: extraire le texte d’un message
 
 function extractMessageBody(msg: WAMessage): string | undefined {
   const m: any = msg.message;
@@ -217,7 +164,7 @@ function extractMessageBody(msg: WAMessage): string | undefined {
   return undefined;
 }
 
-// ------------------------ Webhook externe ------------------------
+// ----------- Helper: envoyer vers le webhook externe
 
 async function postWebhook(
   event: string,
@@ -242,7 +189,7 @@ async function postWebhook(
   }
 }
 
-// ------------------------ Payload style Z-API ------------------------
+// ----------- Helper: payload style Z-API pour un message
 
 function buildZapiLikeMessage(
   msg: WAMessage,
@@ -252,22 +199,23 @@ function buildZapiLikeMessage(
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
 
-  const keyAny: any = msg.key || {};
-  const remoteJidRaw: string | undefined = keyAny.remoteJid;
-  const remoteJidAlt: string | undefined = keyAny.remoteJidAlt;
+  // ⚠️ Baileys v7 / LIDs : on gère remoteJidAlt pour récupérer PN quand possible
+  const remoteJidRaw = msg.key.remoteJid as string | undefined;
+  const remoteJidAlt = (msg.key as any).remoteJidAlt as string | undefined;
 
-  // JID principal de la conversation (WhatsApp) & PN alternatif
-  const chatId = remoteJidRaw || remoteJidAlt || undefined;
-  const chatLid =
-    remoteJidRaw && remoteJidRaw.endsWith("@lid") ? remoteJidRaw : null;
+  const chatJid = remoteJidRaw || remoteJidAlt || null;
 
-  // Le PN, si possible -> priorité au JID alternatif (PN)
-  const phone = jidToPhone(remoteJidAlt || remoteJidRaw || "");
+  const phoneJidForNumber =
+    chatJid && chatJid.endsWith("@lid") ? remoteJidAlt || chatJid : chatJid;
 
-  const isGroup = (remoteJidRaw || "").endsWith("@g.us");
+  const phone = jidToPhone(phoneJidForNumber || "");
+  const isGroup = (chatJid || "").endsWith("@g.us");
+  const fromMe = !!msg.key.fromMe;
+  const tsSec = Number(msg.messageTimestamp || 0) || 0;
+  const tsMs = tsSec * 1000;
 
   const contact =
-    (chatId && sess.contacts.get(chatId)) ||
+    (chatJid && sess.contacts.get(chatJid)) ||
     (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
 
   const displayName =
@@ -275,28 +223,24 @@ function buildZapiLikeMessage(
     contact?.shortName ||
     (msg as any).pushName ||
     phone ||
-    chatId;
-
-  const tsSec = Number(msg.messageTimestamp || 0) || 0;
-  const tsMs = tsSec * 1000;
+    chatJid;
 
   const base: any = {
     isStatusReply: false,
-    chatLid,
+    chatLid: null,
     connectedPhone,
     waitingMessage: false,
     isEdit: false,
     isGroup,
     isNewsletter: false,
     instanceId: orgId,
-    messageId: keyAny.id,
-    remoteJid: remoteJidRaw || null,
-    remoteJidAlt: remoteJidAlt || null,
-    chatId: chatId || null,
-    phone, // ✅ peut être null si groupe, status, etc.
-    fromMe: !!keyAny.fromMe,
+    messageId: msg.key.id,
+    remoteJid: chatJid,
+    chatId: chatJid,
+    phone, // peut être null si seulement LID
+    fromMe,
     momment: tsMs,
-    status: keyAny.fromMe ? "SENT" : "RECEIVED",
+    status: fromMe ? "SENT" : "RECEIVED",
     chatName: displayName,
     senderPhoto: null,
     senderName: displayName,
@@ -308,7 +252,6 @@ function buildZapiLikeMessage(
     fromApi: false,
   };
 
-  // Texte
   const body = extractMessageBody(msg);
   if (body) {
     base.text = { message: body };
@@ -320,7 +263,7 @@ function buildZapiLikeMessage(
       ptt: !!m.audioMessage.ptt,
       seconds: m.audioMessage.seconds || 0,
       audioUrl:
-        keyAny.id && PUBLIC_URL ? buildMediaUrl(orgId, keyAny.id) : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       mimeType: m.audioMessage.mimetype || "audio/ogg; codecs=opus",
       viewOnce: false,
     };
@@ -330,9 +273,9 @@ function buildZapiLikeMessage(
   if (m.imageMessage) {
     base.image = {
       imageUrl:
-        keyAny.id && PUBLIC_URL ? buildMediaUrl(orgId, keyAny.id) : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       thumbnailUrl:
-        keyAny.id && PUBLIC_URL ? buildMediaUrl(orgId, keyAny.id) : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.imageMessage.caption || "",
       mimeType: m.imageMessage.mimetype || "image/jpeg",
       viewOnce: !!m.imageMessage.viewOnce,
@@ -341,11 +284,11 @@ function buildZapiLikeMessage(
     };
   }
 
-  // Vidéo
+  // Video
   if (m.videoMessage) {
     base.video = {
       videoUrl:
-        keyAny.id && PUBLIC_URL ? buildMediaUrl(orgId, keyAny.id) : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.videoMessage.caption || "",
       mimeType: m.videoMessage.mimetype || "video/mp4",
       viewOnce: !!m.videoMessage.viewOnce,
@@ -357,7 +300,7 @@ function buildZapiLikeMessage(
   if (m.documentMessage) {
     base.document = {
       documentUrl:
-        keyAny.id && PUBLIC_URL ? buildMediaUrl(orgId, keyAny.id) : null,
+        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       fileName: m.documentMessage.fileName,
       mimeType: m.documentMessage.mimetype,
       fileSize: m.documentMessage.fileLength,
@@ -366,6 +309,13 @@ function buildZapiLikeMessage(
 
   // Réaction
   if (m.reactionMessage) {
+    const rKey: any = m.reactionMessage.key || {};
+    const rRemote = rKey.remoteJid as string | undefined;
+    const rAlt = rKey.remoteJidAlt as string | undefined;
+    const rPhone = jidToPhone(
+      (rRemote && rRemote.endsWith("@lid") ? rAlt || rRemote : rRemote) || ""
+    );
+
     base.reaction = {
       value:
         m.reactionMessage.text ||
@@ -373,12 +323,12 @@ function buildZapiLikeMessage(
         m.reactionMessage.reaction ||
         "",
       time: tsMs,
-      reactionBy: phone,
+      reactionBy: rPhone,
       referencedMessage: {
-        messageId: m.reactionMessage.key?.id,
-        fromMe: m.reactionMessage.key?.fromMe,
-        phone: jidToPhone(m.reactionMessage.key?.remoteJid || "") || null,
-        participant: m.reactionMessage.key?.participant || null,
+        messageId: rKey.id,
+        fromMe: rKey.fromMe,
+        phone: rPhone,
+        participant: rKey.participant || null,
       },
     };
   }
@@ -386,8 +336,7 @@ function buildZapiLikeMessage(
   return base;
 }
 
-// ------------------------ Normalisation Chats / Contacts ------------------------
-
+// Helpers pour normaliser ce qu’on garde en mémoire
 function normalizeChat(raw: any): ChatSummary | null {
   if (!raw || !raw.id) return null;
   const id = raw.id as string;
@@ -426,7 +375,17 @@ function normalizeContact(raw: any): ContactSummary | null {
   return { id, name, notify, shortName };
 }
 
-// ------------------------ Démarrage de session Baileys ------------------------
+// ----------- Session bootstrap
+
+async function clearSessionAuth(orgId: string) {
+  const authDir = path.join(SESSIONS_DIR, orgId);
+  try {
+    await fs.remove(authDir);
+    logger.info({ orgId, authDir }, "cleared auth directory");
+  } catch (err) {
+    logger.error({ err, orgId, authDir }, "failed clearing auth directory");
+  }
+}
 
 async function startSession(orgId: string): Promise<Session> {
   let sess = sessions.get(orgId);
@@ -465,15 +424,8 @@ async function startSession(orgId: string): Promise<Session> {
   sess.status = "connecting";
   sess.qr = null;
 
-  // Sauvegarde des creds
   sock.ev.on("creds.update", saveCreds);
 
-  // Debug des mappings LID/PN (optionnel)
-  sock.ev.on("lid-mapping.update", (update: any) => {
-    logger.info({ orgId, update }, "lid-mapping.update");
-  });
-
-  // Connexion / QR / fermeture
   sock.ev.on("connection.update", (u: any) => {
     const { connection, lastDisconnect, qr } = u;
 
@@ -536,7 +488,6 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Historique initial
   sock.ev.on("messaging-history.set", (payload: any) => {
     const { chats, contacts, messages, syncType } = payload || {};
 
@@ -574,7 +525,6 @@ async function startSession(orgId: string): Promise<Session> {
     });
   });
 
-  // Chats upsert
   sock.ev.on("chats.upsert", (up: any) => {
     const arr = Array.isArray(up) ? up : up?.chats || [];
     const updated: ChatSummary[] = [];
@@ -592,13 +542,13 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Chats update
   sock.ev.on("chats.update", (updates: any) => {
     const updated: ChatSummary[] = [];
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
+      const existing =
+        sess!.chats.get(id) || ({ id } as ChatSummary);
 
       const merged: ChatSummary = {
         ...existing,
@@ -623,7 +573,6 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Contacts upsert
   sock.ev.on("contacts.upsert", (up: any) => {
     const arr = Array.isArray(up) ? up : up?.contacts || [];
     const updated: ContactSummary[] = [];
@@ -644,13 +593,13 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Contacts update
   sock.ev.on("contacts.update", (updates: any) => {
     const updated: ContactSummary[] = [];
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
+      const existing =
+        sess!.contacts.get(id) || ({ id } as ContactSummary);
 
       const merged: ContactSummary = {
         ...existing,
@@ -671,7 +620,6 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  // Messages entrants
   sock.ev.on("messages.upsert", (m: any) => {
     const up = m.messages || [];
     for (const msg of up as WAMessage[]) {
@@ -684,36 +632,29 @@ async function startSession(orgId: string): Promise<Session> {
         : undefined;
       const body = extractMessageBody(msg);
 
-      const keyAny: any = msg.key || {};
-      const fromJidRaw: string | undefined = keyAny.remoteJid;
-      const fromJidAlt: string | undefined = keyAny.remoteJidAlt;
-      const fromJid = fromJidAlt || fromJidRaw;
+      const fromJid =
+        msg.key.remoteJid || (msg.key as any).remoteJidAlt || undefined;
 
       const simplified = {
-        id: keyAny.id,
+        id: msg.key.id,
         from: fromJid,
-        remoteJid: fromJidRaw,
-        remoteJidAlt: fromJidAlt,
-        fromMe: keyAny.fromMe,
+        fromMe: msg.key.fromMe,
         pushName: (msg as any).pushName,
         timestamp: (msg.messageTimestamp || 0).toString(),
         messageType,
         body,
       };
 
-      // SSE pour Lovable
       getBus(orgId).emit("message", {
         type: "message",
         message: simplified,
       });
 
-      // Webhook INBOUND
-      if (!keyAny.fromMe) {
+      if (!msg.key.fromMe) {
         const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
 
         const webhookPayload = {
           ...simplified,
-          phone: zmsg.phone ?? null,
           zapi: zmsg,
         };
 
@@ -735,7 +676,37 @@ async function startSession(orgId: string): Promise<Session> {
   return sess;
 }
 
-// ------------------------ SSE temps réel ------------------------
+// ----------- Helpers HTTP
+
+function getSessionOr404(orgId: string, res: Response): Session | null {
+  const s = sessions.get(orgId);
+  if (!s || !s.sock?.user) {
+    res.status(400).json({ ok: false, error: "Session not connected" });
+    return null;
+  }
+  return s;
+}
+
+async function bufferFromInput(input?: { url?: string; base64?: string }) {
+  if (!input) return undefined;
+
+  if (input.base64) {
+    const comma = input.base64.indexOf(",");
+    const b64 = comma >= 0 ? input.base64.slice(comma + 1) : input.base64;
+    return Buffer.from(b64, "base64");
+  }
+
+  if (input.url) {
+    const r = await fetch(input.url);
+    if (!r.ok) throw new Error(`fetch failed ${r.status}`);
+    const arr = await r.arrayBuffer();
+    return Buffer.from(arr);
+  }
+
+  return undefined;
+}
+
+// ----------- SSE
 
 app.get("/wa/sse", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
@@ -809,7 +780,7 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   });
 });
 
-// ------------------------ Auth / Status ------------------------
+// ----------- Auth / Status
 
 app.post("/wa/login", async (req: Request, res: Response) => {
   const { orgId } = req.body || {};
@@ -862,7 +833,6 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// Bootstrap (chats + contacts)
 app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
@@ -890,14 +860,11 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   });
 });
 
-// Avatar
 app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
   if (!orgId || !jid) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,jid required" });
+    return res.status(400).json({ ok: false, error: "orgId,jid required" });
   }
 
   const s = getSessionOr404(orgId, res);
@@ -912,7 +879,6 @@ app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   }
 });
 
-// Logout
 app.post("/wa/logout", async (req: Request, res: Response) => {
   const { orgId } = req.body || {};
   if (!orgId) {
@@ -934,7 +900,7 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ------------------------ ENVOI DE MESSAGES ------------------------
+// ----------- ENVOI DE MESSAGES
 
 app.post("/wa/send/text", async (req: Request, res: Response) => {
   const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
@@ -965,10 +931,9 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, content, options);
 
     if (!sent) {
-      logger.error({ orgId, jid, text }, "sendMessage(text) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1006,10 +971,9 @@ app.post("/wa/send/image", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, msg);
 
     if (!sent) {
-      logger.error({ orgId, jid }, "sendMessage(image) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1055,10 +1019,9 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, msg);
 
     if (!sent) {
-      logger.error({ orgId, jid }, "sendMessage(document) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1097,10 +1060,9 @@ app.post("/wa/send/audio", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, msg);
 
     if (!sent) {
-      logger.error({ orgId, jid }, "sendMessage(audio) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1147,10 +1109,9 @@ app.post("/wa/send/buttons", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, msg);
 
     if (!sent) {
-      logger.error({ orgId, jid }, "sendMessage(buttons) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1200,10 +1161,9 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
     const sent = await s.sock!.sendMessage(jid, msg);
 
     if (!sent) {
-      logger.error({ orgId, jid }, "sendMessage(list) returned undefined");
       return res
         .status(500)
-        .json({ ok: false, error: "sendMessage failed" });
+        .json({ ok: false, error: "sendMessage returned undefined" });
     }
 
     void postWebhook("message.outgoing", String(orgId), {
@@ -1220,7 +1180,7 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
   }
 });
 
-// ------------------------ Lecture messages / médias ------------------------
+// ----------- Lecture messages récents
 
 app.get("/wa/messages/recent", (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
@@ -1237,7 +1197,7 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
     const body = extractMessageBody(msg);
     out.push({
       id,
-      from: msg.key.remoteJid,
+      from: msg.key.remoteJid || (msg.key as any).remoteJidAlt,
       fromMe: msg.key.fromMe,
       timestamp: (msg.messageTimestamp || 0).toString(),
       type: msg.message ? Object.keys(msg.message)[0] : undefined,
@@ -1304,7 +1264,7 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
       .json({ ok: false, error: "orgId,msgId required" });
   }
 
-  const s = getSessionOr404(String(orgId), res);
+  const s = getSessionOr404(orgId, res);
   if (!s) return;
 
   const msg = s.msgCache.get(String(msgId));
@@ -1337,13 +1297,13 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   }
 });
 
-// ------------------------ Healthcheck ------------------------
+// ----------- Health
 
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "zuria-baileys", ts: Date.now() })
 );
 
-// ------------------------ Boot ------------------------
+// ----------- Boot
 
 async function main() {
   await fs.ensureDir(SESSIONS_DIR);
