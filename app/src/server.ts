@@ -7,7 +7,7 @@ import fs from "fs-extra";
 import path from "path";
 import { LRUCache } from "lru-cache";
 import { lookup as mimeLookup } from "mime-types";
-import EventEmitter from "eventemitter3";
+import { EventEmitter } from "events"; // ✅ Node core EventEmitter
 import QRCode from "qrcode";
 
 // Baileys
@@ -277,7 +277,7 @@ function buildZapiLikeMessage(
     isNewsletter: false,
     instanceId: orgId,
     messageId: msg.key.id,
-    // ✅ on ajoute explicitement ces 2 champs pour Supabase / Lovable
+    // ✅ champs utiles pour wa-webhook
     remoteJid: remoteJid || null,
     chatId: remoteJid || null,
     phone, // peut être null pour @lid / groupes
@@ -565,7 +565,7 @@ async function startSession(orgId: string): Promise<Session> {
     });
 
     // ❗ On NE pousse PAS cet historique vers le webhook
-    // => tu as dit que les anciens historiques ne t’intéressent pas pour le scoring
+    // => seuls les nouveaux messages comptent pour le scoring
   });
 
   // Chats & contacts live updates
@@ -700,7 +700,7 @@ async function startSession(orgId: string): Promise<Session> {
         const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
 
         const webhookPayload = {
-          // ancien format (compatibilité avec ton wa-webhook actuel)
+          // ancien format (compat)
           ...simplified,
           // nouveau champ: message complet façon Z-API
           zapi: zmsg,
