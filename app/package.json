@@ -20,6 +20,8 @@
     "mime-types": "^2.1.35",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
+		"link-preview-js": "^3.0.5"
+
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
