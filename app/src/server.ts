@@ -67,6 +67,8 @@ type ContactSummary = {
   name?: string;
   notify?: string;
   shortName?: string;
+  phone?: string | null;   // ✅ numéro normalisé si dispo (waid, etc.)
+  raw?: any;               // ✅ on garde le brut au cas où tu veuilles debugger
 };
 
 type Session = {
@@ -250,7 +252,7 @@ function buildZapiLikeMessage(
   const connectedPhone = getConnectedPhone(sess);
 
   const remoteJid = msg.key.remoteJid as string | undefined;
-  const phone = jidToPhone(remoteJid || "");
+  const phoneFromJid = jidToPhone(remoteJid || "");
   const isGroup = (remoteJid || "").endsWith("@g.us");
   const fromMe = !!msg.key.fromMe;
   const tsSec = Number(msg.messageTimestamp || 0) || 0;
@@ -258,13 +260,17 @@ function buildZapiLikeMessage(
 
   const contact =
     (remoteJid && sess.contacts.get(remoteJid)) ||
-    (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
+    (phoneFromJid
+      ? sess.contacts.get(`${phoneFromJid}@s.whatsapp.net`)
+      : undefined);
+
+  const contactPhone = contact?.phone ?? phoneFromJid ?? null;
 
   const displayName =
     contact?.name ||
     contact?.shortName ||
     (msg as any).pushName ||
-    phone ||
+    contactPhone ||
     remoteJid;
 
   const base: any = {
@@ -280,7 +286,7 @@ function buildZapiLikeMessage(
     // ✅ champs utiles pour wa-webhook
     remoteJid: remoteJid || null,
     chatId: remoteJid || null,
-    phone, // peut être null pour @lid / groupes
+    phone: contactPhone, // ✅ numéro du contact si dispo (waid, etc.)
     fromMe,
     momment: tsMs,
     status: fromMe ? "SENT" : "RECEIVED",
@@ -293,6 +299,21 @@ function buildZapiLikeMessage(
     forwarded: !!m.contextInfo?.isForwarded,
     type: "ReceivedCallback",
     fromApi: false,
+
+    // ✅ Nouveau: bloc contact complet
+    contact: contact
+      ? {
+          id: contact.id,
+          name: contact.name ?? null,
+          shortName: contact.shortName ?? null,
+          phone: contact.phone ?? null,
+        }
+      : {
+          id: remoteJid || null,
+          name: displayName ?? null,
+          shortName: displayName ?? null,
+          phone: contactPhone,
+        },
   };
 
   // Texte
@@ -360,7 +381,7 @@ function buildZapiLikeMessage(
         m.reactionMessage.reaction ||
         "",
       time: tsMs,
-      reactionBy: phone,
+      reactionBy: contactPhone,
       referencedMessage: {
         messageId: m.reactionMessage.key?.id,
         fromMe: m.reactionMessage.key?.fromMe,
@@ -406,10 +427,47 @@ function normalizeChat(raw: any): ChatSummary | null {
 function normalizeContact(raw: any): ContactSummary | null {
   if (!raw || !raw.id) return null;
   const id = raw.id as string;
-  const name = raw.name || raw.notify || raw.pushName || id;
+  const name =
+    raw.name ||
+    raw.notify ||
+    raw.pushName ||
+    raw.verifiedName ||
+    id;
   const notify = raw.notify;
-  const shortName = raw.shortName || raw.name || raw.pushName || name;
-  return { id, name, notify, shortName };
+  const shortName =
+    raw.shortName ||
+    raw.name ||
+    raw.pushName ||
+    raw.verifiedName ||
+    name;
+
+  // ✅ Tentative "best-effort" pour récupérer le numéro
+  let phone: string | null = null;
+
+  // 1) Beaucoup de clients WhatsApp exposent `waid` (string de chiffres)
+  if (typeof raw.waid === "string") {
+    const digits = raw.waid.replace(/[^\d]/g, "");
+    if (digits) phone = digits;
+  }
+
+  // 2) Certains exposent `phoneNumber`
+  if (!phone && typeof raw.phoneNumber === "string") {
+    const digits = raw.phoneNumber.replace(/[^\d]/g, "");
+    if (digits) phone = digits;
+  }
+
+  // 3) Fallback: un champ `number`
+  if (!phone && typeof raw.number === "string") {
+    const digits = raw.number.replace(/[^\d]/g, "");
+    if (digits) phone = digits;
+  }
+
+  // 4) Dernier fallback: on dérive du JID si c'est un @s.whatsapp.net
+  if (!phone) {
+    phone = jidToPhone(id);
+  }
+
+  return { id, name, notify, shortName, phone, raw };
 }
 
 // ----------- Session bootstrap
@@ -650,6 +708,12 @@ async function startSession(orgId: string): Promise<Session> {
         name: u.name || u.notify || existing.name,
         notify: u.notify ?? existing.notify,
         shortName: u.shortName ?? existing.shortName,
+        phone:
+          existing.phone ??
+          (typeof u.waid === "string"
+            ? u.waid.replace(/[^\d]/g, "")
+            : existing.phone),
+        raw: existing.raw ?? u,
       };
 
       sess!.contacts.set(id, merged);
@@ -677,14 +741,34 @@ async function startSession(orgId: string): Promise<Session> {
         : undefined;
       const body = extractMessageBody(msg);
 
+      const remoteJid = msg.key.remoteJid as string | undefined;
+      const phoneFromJid = jidToPhone(remoteJid || "");
+      const contact =
+        (remoteJid && sess!.contacts.get(remoteJid)) ||
+        (phoneFromJid
+          ? sess!.contacts.get(`${phoneFromJid}@s.whatsapp.net`)
+          : undefined);
+      const contactPhone = contact?.phone ?? phoneFromJid ?? null;
+      const contactName =
+        contact?.name ||
+        contact?.shortName ||
+        (msg as any).pushName ||
+        contactPhone ||
+        remoteJid;
+
       const simplified = {
         id: msg.key.id,
-        from: msg.key.remoteJid,
+        from: remoteJid,
         fromMe: msg.key.fromMe,
         pushName: (msg as any).pushName,
         timestamp: (msg.messageTimestamp || 0).toString(),
         messageType,
         body,
+        contact: {
+          id: remoteJid || null,
+          name: contactName || null,
+          phone: contactPhone,
+        },
       };
 
       // 🔴 SSE pour Lovable (UI)
@@ -693,16 +777,11 @@ async function startSession(orgId: string): Promise<Session> {
         message: simplified,
       });
 
-      // 🔔 Webhook Supabase (INBOUND) :
-      // -> on GARDE l'ancien format: payload.body / payload.from / payload.pushName
-      // -> on AJOUTE en plus payload.zapi avec la version "Z-API-like"
+      // 🔔 Webhook Supabase (INBOUND)
       if (!msg.key.fromMe) {
         const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
-
         const webhookPayload = {
-          // ancien format (compat)
           ...simplified,
-          // nouveau champ: message complet façon Z-API
           zapi: zmsg,
         };
 
