@@ -109,6 +109,64 @@ function phoneToJid(to: string): string {
   return `${digits}@s.whatsapp.net`;
 }
 
+/**
+ * OUTBOUND LID resolution (best effort)
+ * - accepte: numéro brut, PN JID, LID JID, g.us, etc.
+ * - tente: PN -> LID via sock.signalRepository.lidMapping.getLIDForPN (qui déclenche USync dans Baileys v7)
+ */
+function normalizeToJid(to: string): string {
+  const v = String(to || "").trim();
+  if (!v) return "";
+  if (v.includes("@")) return v; // déjà un JID
+  return phoneToJid(v); // numéro brut -> PN JID
+}
+
+async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> {
+  const lidStore = sock?.signalRepository?.lidMapping;
+  if (!lidStore || typeof lidStore.getLIDForPN !== "function") return null;
+
+  try {
+    const raw = await Promise.resolve(lidStore.getLIDForPN(pnJid));
+    if (!raw) return null;
+
+    const s = String(raw);
+    if (!s) return null;
+
+    // selon impl, ça peut être "124..." ou "124...@lid"
+    return s.includes("@") ? s : `${s}@lid`;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveRecipientJid(
+  sock: any,
+  to: string
+): Promise<{ sendJid: string; toPn: string | null; toLid: string | null }> {
+  const jid0 = normalizeToJid(to);
+
+  if (!jid0) return { sendJid: "", toPn: null, toLid: null };
+
+  // Si déjà LID, on utilise tel quel
+  if (jid0.endsWith("@lid")) {
+    return { sendJid: jid0, toPn: null, toLid: jid0 };
+  }
+
+  // Si pas PN, on ne tente pas de mapping (group/newsletter/etc.)
+  if (!jid0.endsWith("@s.whatsapp.net")) {
+    return { sendJid: jid0, toPn: null, toLid: null };
+  }
+
+  const pnJid = jid0;
+  const lidJid = await getLidForPnJid(sock, pnJid);
+
+  return {
+    sendJid: lidJid || pnJid,
+    toPn: pnJid,
+    toLid: lidJid || null,
+  };
+}
+
 async function bufferFromInput(input?: { url?: string; base64?: string }) {
   if (!input) return undefined;
 
@@ -159,7 +217,7 @@ function jidToPhone(jid?: string | null): string | null {
   if (!local) return null;
 
   // Cas à ignorer pour le "numéro" :
-  // - LID (identifiants internes Business / multi-device)
+  // - LID
   // - groupes
   // - status / broadcast / newsletters
   // - JID contenant un "-" (souvent groupes)
@@ -486,6 +544,11 @@ async function startSession(orgId: string): Promise<Session> {
   // Sauvegarde des creds
   sock.ev.on("creds.update", saveCreds);
 
+  // (Optionnel) log si Baileys découvre des mappings PN<->LID
+  sock.ev.on("lid-mapping.update", (m: any) => {
+    logger.info({ orgId, m }, "lid-mapping.update");
+  });
+
   // Événements de connexion
   sock.ev.on("connection.update", (u: any) => {
     const { connection, lastDisconnect, qr } = u;
@@ -595,7 +658,6 @@ async function startSession(orgId: string): Promise<Session> {
     });
 
     // ❗ On NE pousse PAS cet historique vers le webhook
-    // => tu as dit que les anciens historiques ne t’intéressent pas pour le scoring
   });
 
   // Chats & contacts live updates
@@ -621,8 +683,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing =
-        sess!.chats.get(id) || ({ id } as ChatSummary);
+      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
 
       const merged: ChatSummary = {
         ...existing,
@@ -672,8 +733,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     for (const u of updates || []) {
       const id = u.id as string;
-      const existing =
-        sess!.contacts.get(id) || ({ id } as ContactSummary);
+      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
 
       const merged: ContactSummary = {
         ...existing,
@@ -708,9 +768,7 @@ async function startSession(orgId: string): Promise<Session> {
       const isGroup = (remoteJid || "").endsWith("@g.us");
       const isLidChat = (remoteJid || "").endsWith("@lid");
 
-      const messageType = msg.message
-        ? Object.keys(msg.message)[0]
-        : undefined;
+      const messageType = msg.message ? Object.keys(msg.message)[0] : undefined;
       const body = extractMessageBody(msg);
 
       let phone: string | null = null;
@@ -760,8 +818,6 @@ async function startSession(orgId: string): Promise<Session> {
       });
 
       // 🔔 Webhook Supabase (INBOUND) :
-      // -> on GARDE l'ancien format: payload.body / payload.from / payload.pushName
-      // -> on AJOUTE en plus payload.zapi avec la version "Z-API-like"
       if (!msg.key.fromMe) {
         const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
 
@@ -934,8 +990,7 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   }
 
   const chats = Array.from(s.chats.values()).sort(
-    (a, b) =>
-      (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
+    (a, b) => (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
   );
 
   const contacts = Array.from(s.contacts.values());
@@ -952,9 +1007,7 @@ app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
   if (!orgId || !jid) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,jid required" });
+    return res.status(400).json({ ok: false, error: "orgId,jid required" });
   }
 
   const s = getSessionOr404(orgId, res);
@@ -1006,31 +1059,43 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
+
     const options: any = {};
 
     if (quotedMsgId) {
       options.quoted = {
-        key: { id: quotedMsgId, fromMe: false, remoteJid: jid },
+        key: { id: quotedMsgId, fromMe: false, remoteJid: sendJid },
       };
     }
 
     const content: AnyMessageContent = { text: String(text) };
     if (Array.isArray(mentions) && mentions.length) {
-      (content as any).mentions = mentions.map((p: string) => phoneToJid(p));
+      (content as any).mentions = mentions
+        .map((p: string) => normalizeToJid(p))
+        .filter(Boolean);
     }
 
-    const sent = await s.sock!.sendMessage(jid, content, options);
+    const sent = await s.sock!.sendMessage(sendJid, content, options);
 
     // Webhook: message sortant (via Zuria)
     void postWebhook("message.outgoing", String(orgId), {
       kind: "text",
-      to: jid,
+      to: sendJid, // JID réellement utilisé
+      toPn, // alias PN si connu
+      toLid, // alias LID si résolu
       key: sent.key,
       body: String(text),
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1048,23 +1113,33 @@ app.post("/wa/send/image", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
+
     const buf = await bufferFromInput(image);
 
     const msg: AnyMessageContent = buf
       ? { image: buf, caption }
       : { image: { url: image.url }, caption };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendJid, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "image",
-      to: jid,
+      to: sendJid,
+      toPn,
+      toLid,
       key: sent.key,
       caption: caption || null,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1082,7 +1157,15 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
+
     const buf = await bufferFromInput(document);
 
     const msg: AnyMessageContent = buf
@@ -1097,17 +1180,19 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
           mimetype,
         };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendJid, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "document",
-      to: jid,
+      to: sendJid,
+      toPn,
+      toLid,
       key: sent.key,
       fileName: fileName || "file",
       mimetype: mimetype || null,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1125,23 +1210,33 @@ app.post("/wa/send/audio", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
+
     const buf = await bufferFromInput(audio);
 
     const msg: AnyMessageContent = buf
       ? { audio: buf, ptt: Boolean(ptt) }
       : { audio: { url: audio.url }, ptt: Boolean(ptt) };
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendJid, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "audio",
-      to: jid,
+      to: sendJid,
+      toPn,
+      toLid,
       key: sent.key,
       ptt: Boolean(ptt),
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -1160,7 +1255,14 @@ app.post("/wa/send/buttons", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const msg: AnyMessageContent = {
       text,
@@ -1175,24 +1277,25 @@ app.post("/wa/send/buttons", async (req: Request, res: Response) => {
       headerType: 1,
     } as any;
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendJid, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "buttons",
-      to: jid,
+      to: sendJid,
+      toPn,
+      toLid,
       key: sent.key,
       text,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
 app.post("/wa/send/list", async (req: Request, res: Response) => {
-  const { orgId, to, title, text, footer, buttonText, sections } =
-    req.body || {};
+  const { orgId, to, title, text, footer, buttonText, sections } = req.body || {};
   if (!orgId || !to || !text || !Array.isArray(sections)) {
     return res.status(400).json({
       ok: false,
@@ -1204,7 +1307,14 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const jid = phoneToJid(String(to));
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const msg: AnyMessageContent = {
       text,
@@ -1221,17 +1331,19 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
       })),
     } as any;
 
-    const sent = await s.sock!.sendMessage(jid, msg);
+    const sent = await s.sock!.sendMessage(sendJid, msg);
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "list",
-      to: jid,
+      to: sendJid,
+      toPn,
+      toLid,
       key: sent.key,
       title,
       text,
     });
 
-    res.json({ ok: true, key: sent.key });
+    res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
