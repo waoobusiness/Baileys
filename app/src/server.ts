@@ -40,12 +40,6 @@ const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 // URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
-// API key optionnelle pour protéger /wa/resolve et /wa/send/*
-const WA_API_KEY =
-  process.env.WA_API_KEY ||
-  process.env.GATEWAY_API_KEY ||
-  process.env.WA_GATEWAY_API_KEY ||
-  "";
 
 // ----------- App
 
