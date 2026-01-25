@@ -908,62 +908,41 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// ----------- LID Resolver (PN -> LID) for Edge Function
-
-const RESOLVE_BEARER =
-  process.env.RESOLVER_BEARER ||
-  process.env.GATEWAY_AUTH_BEARER ||
-  process.env.GATEWAY_BEARER ||
-  "";
-
-function requireBearer(req: Request, res: Response): boolean {
-  // Si aucun token n'est défini, on laisse passer (mode dev).
-  if (!RESOLVE_BEARER) return true;
-
-  const auth = String(req.headers.authorization || "");
-  if (auth === `Bearer ${RESOLVE_BEARER}`) return true;
-
-  res.status(401).json({ ok: false, error: "unauthorized" });
-  return false;
-}
+// ----------- LID Resolver (Debug)
 
 app.post("/wa/resolve", async (req: Request, res: Response) => {
-  if (!requireBearer(req, res)) return;
+  const body = req.body || {};
 
-  const { orgId, to, sendTest, testText } = req.body || {};
+  // on accepte plusieurs noms de champs pour éviter les erreurs de payload
+  const orgId = String(body.orgId || "");
+  const to = String(body.to || body.phone || body.phoneNumber || "");
+  const sendTest = Boolean(body.sendTest);
+  const testText = String(body.testText || "ping");
 
   if (!orgId || !to) {
     return res.status(400).json({ ok: false, error: "orgId,to required" });
   }
 
-  const s = getSessionOr404(String(orgId), res);
+  const s = getSessionOr404(orgId, res);
   if (!s) return;
 
   try {
-    // "to" peut être un numéro (+41...) ou déjà un jid
-    const toStr = String(to);
-    const phoneOrJid = toStr.includes("@") ? toStr : toStr;
-    const { pn, lid, sendTo } = toStr.includes("@")
-      ? { pn: toStr, lid: toStr.endsWith("@lid") ? toStr : null, sendTo: toStr }
-      : await resolveSendJid(s, phoneOrJid);
+    const { pn, lid, sendTo } = await resolveSendJid(s, to);
 
     let sentKey: any = null;
-
     if (sendTest) {
-      const text = String(testText || "ping");
-      const sent = await s.sock!.sendMessage(sendTo, { text });
+      const sent = await s.sock!.sendMessage(sendTo, { text: testText });
       sentKey = sent?.key || null;
     }
 
     return res.json({
       ok: true,
-      orgId: String(orgId),
-      input: toStr,
+      orgId,
+      input: to,
       pn,
       lid,
       sendTo,
       sentKey,
-      ts: Date.now(),
     });
   } catch (err) {
     logger.error({ err, orgId, to }, "GW /wa/resolve error");
