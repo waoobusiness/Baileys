@@ -40,6 +40,8 @@ const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 // URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
+// Clé API optionnelle
+const WA_API_KEY = process.env.WA_API_KEY || process.env.API_KEY || "";
 
 // ----------- App
 
@@ -153,7 +155,6 @@ async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> 
     const s = String(raw);
     if (!s) return null;
 
-    // selon impl, ça peut être "124..." ou "124...@lid"
     return s.includes("@") ? s : `${s}@lid`;
   } catch {
     return null;
@@ -171,7 +172,6 @@ async function getPnForLidJid(sock: any, lidJid: string): Promise<string | null>
     const s = String(raw);
     if (!s) return null;
 
-    // selon impl, ça peut être "4178..." ou "4178...@s.whatsapp.net"
     return s.includes("@") ? s : `${s}@s.whatsapp.net`;
   } catch {
     return null;
@@ -256,7 +256,6 @@ function jidToPhone(jid?: string | null): string | null {
   const [local, domain] = jid.split("@");
   if (!local) return null;
 
-  // Cas à ignorer pour le "numéro"
   if (
     domain === "lid" ||
     domain === "g.us" ||
@@ -322,14 +321,9 @@ async function postWebhook(event: string, orgId: string, payload: any): Promise<
   }
 }
 
-// ----------- Helper: payload style Z-API pour un message
-// LID aware: on essaie de retrouver le PN via remoteJidAlt ou le store lidMapping
+// ----------- Helper: payload style Z-API pour un message (LID aware)
 
-async function buildZapiLikeMessage(
-  msg: WAMessage,
-  sess: Session,
-  orgId: string
-): Promise<any> {
+async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): Promise<any> {
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
 
@@ -348,7 +342,6 @@ async function buildZapiLikeMessage(
 
   if (remoteJid) {
     if (isLidChat && !isGroup) {
-      // DM avec LID -> on essaie de retrouver le PN
       let pnJid: string | undefined = remoteJidAlt;
 
       if (!pnJid && sess.sock) {
@@ -363,11 +356,8 @@ async function buildZapiLikeMessage(
         }
       }
 
-      if (pnJid) {
-        phone = jidToPhone(pnJid);
-      }
+      if (pnJid) phone = jidToPhone(pnJid);
     } else {
-      // Cas classique (PN ou groupe)
       phone = jidToPhone(remoteJid);
     }
   }
@@ -380,11 +370,7 @@ async function buildZapiLikeMessage(
     (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
 
   const displayName =
-    contact?.name ||
-    contact?.shortName ||
-    (msg as any).pushName ||
-    phone ||
-    chatId;
+    contact?.name || contact?.shortName || (msg as any).pushName || phone || chatId;
 
   const base: any = {
     isStatusReply: false,
@@ -460,11 +446,7 @@ async function buildZapiLikeMessage(
 
   if (m.reactionMessage) {
     base.reaction = {
-      value:
-        m.reactionMessage.text ||
-        m.reactionMessage.emoji ||
-        m.reactionMessage.reaction ||
-        "",
+      value: m.reactionMessage.text || m.reactionMessage.emoji || m.reactionMessage.reaction || "",
       time: tsMs,
       reactionBy: phone,
       referencedMessage: {
@@ -570,7 +552,6 @@ async function startSession(orgId: string): Promise<Session> {
       sess!.qr = null;
       getBus(orgId).emit("status", { type: "connected", user: sock.user });
       logger.info({ orgId }, "WA connected");
-
       void postWebhook("connection.open", orgId, { user: sock.user });
       return;
     }
@@ -591,7 +572,6 @@ async function startSession(orgId: string): Promise<Session> {
       getBus(orgId).emit("status", { type: "closed", code, willReconnect });
 
       logger.warn({ orgId, code, willReconnect }, "WA closed");
-
       void postWebhook("connection.close", orgId, { code, willReconnect });
 
       if (!willReconnect) {
@@ -600,9 +580,7 @@ async function startSession(orgId: string): Promise<Session> {
       } else {
         setTimeout(() => {
           logger.info({ orgId, code }, "auto-restart WA session");
-          startSession(orgId).catch((err) =>
-            logger.error({ err, orgId }, "failed to restart session")
-          );
+          startSession(orgId).catch((err) => logger.error({ err, orgId }, "failed to restart session"));
         }, 1000);
       }
     }
@@ -691,9 +669,7 @@ async function startSession(orgId: string): Promise<Session> {
       }
     }
 
-    if (updated.length) {
-      getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
-    }
+    if (updated.length) getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
   });
 
   sock.ev.on("contacts.update", (updates: any) => {
@@ -743,7 +719,9 @@ async function startSession(orgId: string): Promise<Session> {
               try {
                 const v = await Promise.resolve(lidStore.getPNForLID(remoteJid));
                 pnJid = v || undefined;
-              } catch {}
+              } catch {
+                // ignore
+              }
             }
           }
 
@@ -788,6 +766,19 @@ async function startSession(orgId: string): Promise<Session> {
 
   return sess;
 }
+
+// ----------- Debug: lister les routes (utile pour diagnostiquer un 404)
+
+app.get("/debug/routes", (_req: Request, res: Response) => {
+  const stack = (app as any)?._router?.stack || [];
+  const routes = stack
+    .filter((l: any) => l.route && l.route.path)
+    .map((l: any) => ({
+      path: l.route.path,
+      methods: Object.keys(l.route.methods || {}),
+    }));
+  res.json({ ok: true, routes });
+});
 
 // ----------- SSE (événements temps réel)
 
@@ -908,12 +899,12 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// ----------- LID Resolver (Debug)
+// ----------- LID RESOLVE (DEBUG) : PN -> LID (option ping)
+// Une seule définition (corrigée). Payload flexible: to|phone|phoneNumber
 
-app.post("/wa/resolve", async (req: Request, res: Response) => {
+app.post("/wa/resolve", requireGatewayAuth, async (req: Request, res: Response) => {
   const body = req.body || {};
 
-  // on accepte plusieurs noms de champs pour éviter les erreurs de payload
   const orgId = String(body.orgId || "");
   const to = String(body.to || body.phone || body.phoneNumber || "");
   const sendTest = Boolean(body.sendTest);
@@ -923,25 +914,36 @@ app.post("/wa/resolve", async (req: Request, res: Response) => {
     return res.status(400).json({ ok: false, error: "orgId,to required" });
   }
 
-  const s = getSessionOr404(orgId, res);
+  const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { pn, lid, sendTo } = await resolveSendJid(s, to);
+    let { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, to);
+
+    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
 
     let sentKey: any = null;
+
     if (sendTest) {
-      const sent = await s.sock!.sendMessage(sendTo, { text: testText });
-      sentKey = sent?.key || null;
+      const sent = await s.sock!.sendMessage(sendJid, { text: testText });
+      sentKey = sent?.key ?? null;
+
+      if (!toLid && toPn) {
+        const lidTry = await getLidForPnJid(s.sock, toPn);
+        if (lidTry) {
+          toLid = lidTry;
+          sendJid = lidTry;
+        }
+      }
     }
 
     return res.json({
       ok: true,
       orgId,
       input: to,
-      pn,
-      lid,
-      sendTo,
+      toPn,
+      toLid,
+      sendJid,
       sentKey,
     });
   } catch (err) {
@@ -1008,56 +1010,6 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ----------- LID RESOLVE (DEBUG) : PN -> LID (option ping)
-
-app.post("/wa/resolve", requireGatewayAuth, async (req: Request, res: Response) => {
-  const { orgId, to, sendTest, testText } = req.body || {};
-  if (!orgId || !to) {
-    return res.status(400).json({ ok: false, error: "orgId,to required" });
-  }
-
-  const s = getSessionOr404(String(orgId), res);
-  if (!s) return;
-
-  try {
-    // 1) première tentative de résolution
-    let { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-
-    if (!sendJid) {
-      return res.status(400).json({ ok: false, error: "Invalid recipient" });
-    }
-
-    let sentKey: any = null;
-
-    // 2) optionnel: envoyer un message test (pour forcer un mapping côté WA)
-    if (sendTest) {
-      const txt = String(testText || "ping");
-      const sent = await s.sock!.sendMessage(sendJid, { text: txt });
-      sentKey = sent?.key ?? null;
-
-      // 3) best effort: retenter juste après si on n'avait pas de LID
-      if (!toLid && toPn) {
-        const lidTry = await getLidForPnJid(s.sock, toPn);
-        if (lidTry) {
-          toLid = lidTry;
-          sendJid = lidTry;
-        }
-      }
-    }
-
-    return res.json({
-      ok: true,
-      to: String(to),
-      toPn,
-      toLid,
-      sendJid,
-      sentKey,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
 // ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
 
 app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response) => {
@@ -1071,7 +1023,6 @@ app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response
 
   try {
     const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-
     if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
 
     const options: any = {};
@@ -1084,9 +1035,7 @@ app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response
 
     const content: AnyMessageContent = { text: String(text) };
     if (Array.isArray(mentions) && mentions.length) {
-      (content as any).mentions = mentions
-        .map((p: string) => normalizeToJid(p))
-        .filter(Boolean);
+      (content as any).mentions = mentions.map((p: string) => normalizeToJid(p)).filter(Boolean);
     }
 
     const sent = await s.sock!.sendMessage(sendJid, content, options);
@@ -1342,12 +1291,10 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
   if (!msg) return res.status(404).json({ ok: false, error: "Message not in cache" });
 
   try {
-    const buffer = await downloadMediaMessage(
-      msg,
-      "buffer",
-      {},
-      { logger, reuploadRequest: s.sock!.updateMediaMessage }
-    );
+    const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+      logger,
+      reuploadRequest: s.sock!.updateMediaMessage,
+    });
 
     const m =
       (msg.message as any)?.imageMessage?.mimetype ||
@@ -1357,7 +1304,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       mimeLookup("bin") ||
       "application/octet-stream";
 
-    const base64 = buffer.toString("base64");
+    const base64 = (buffer as Buffer).toString("base64");
 
     res.json({
       ok: true,
@@ -1382,12 +1329,10 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   if (!msg) return res.status(404).json({ ok: false, error: "Message not in cache" });
 
   try {
-    const buffer = await downloadMediaMessage(
-      msg,
-      "buffer",
-      {},
-      { logger, reuploadRequest: s.sock!.updateMediaMessage }
-    );
+    const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+      logger,
+      reuploadRequest: s.sock!.updateMediaMessage,
+    });
 
     const m =
       (msg.message as any)?.imageMessage?.mimetype ||
@@ -1406,9 +1351,7 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
 
 // ----------- Health
 
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "zuria-baileys", ts: Date.now() })
-);
+app.get("/health", (_req, res) => res.json({ ok: true, service: "zuria-baileys", ts: Date.now() }));
 
 // ----------- Boot
 
