@@ -945,6 +945,55 @@ app.get("/wa/status", async (req: Request, res: Response) => {
     connected: Boolean(s?.sock?.user),
   });
 });
+app.post("/wa/resolve", async (req: Request, res: Response) => {
+  const { orgId, to, peer, phone } = req.body || {};
+  const input = String(to || peer || phone || "").trim();
+
+  if (!orgId || !input) {
+    return res.status(400).json({
+      ok: false,
+      error: "orgId and (to|peer|phone) required",
+    });
+  }
+
+  const org = String(orgId);
+
+  // Si pas connecté, on renvoie au moins un JID PN (fallback) pour éviter de casser l'edge function
+  const sess = sessions.get(org);
+  const sock = sess?.sock;
+
+  try {
+    const pnJid = normalizeToJid(input); // numéro brut -> PN JID, JID inchangé si déjà JID
+
+    if (!sock || !sock.user) {
+      return res.json({
+        ok: true,
+        input,
+        connected: false,
+        sendJid: pnJid,
+        toPn: pnJid.endsWith("@s.whatsapp.net") ? pnJid : null,
+        toLid: pnJid.endsWith("@lid") ? pnJid : null,
+      });
+    }
+
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(sock, input);
+
+    return res.json({
+      ok: true,
+      input,
+      connected: true,
+      sendJid,
+      toPn,
+      toLid,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: "resolve_failed",
+      detail: String(err),
+    });
+  }
+});
 
 app.get("/wa/qr", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
