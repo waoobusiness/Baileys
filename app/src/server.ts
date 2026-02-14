@@ -28,7 +28,7 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PORT = Number(process.env.PORT || 3000);
 
-// On prend d'abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
+// On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
@@ -40,8 +40,10 @@ const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 // URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
-// Option: stocker raw contact en mémoire (peut coûter cher en RAM)
-const STORE_RAW_CONTACT = process.env.WA_STORE_RAW_CONTACT === "1";
+// Restart tuning
+const RESTART_BASE_MS = 1000;
+const RESTART_MAX_MS = 30_000;
+const RESTART_JITTER_MS = 500;
 
 // ----------- App
 
@@ -68,8 +70,8 @@ type ContactSummary = {
   name?: string;
   notify?: string;
   shortName?: string;
-  phone?: string | null; // numéro normalisé si dispo (waid, etc.)
-  raw?: any; // seulement si WA_STORE_RAW_CONTACT=1
+  phone?: string | null;
+  raw?: any;
 };
 
 type Session = {
@@ -77,18 +79,24 @@ type Session = {
   sock?: WASocket;
   saveCreds?: () => Promise<void>;
   bus: EventEmitter;
+
   qr?: string | null;
+  qrSvg?: string | null;
+  lastQrAt?: number | null;
+
   status: SessionStatus;
+
   msgCache: LRUCache<string, WAMessage>;
   chats: Map<string, ChatSummary>;
   contacts: Map<string, ContactSummary>;
 
-  // Anti-storm / anti-OOM
-  startPromise?: Promise<Session> | null;
-  reconnectTimer?: NodeJS.Timeout | null;
-  reconnectFailCount: number;
-  lastKnownPhone: string | null; // digits E.164 sans +
-  stableSessionId: string | null; // wa_${orgId}_${phoneDigits}
+  // Anti-concurrency
+  startPromise?: Promise<Session>;
+
+  // Restart control
+  restartTimer?: NodeJS.Timeout | null;
+  restartAttempt?: number;
+  lastClose?: { code: number; willReconnect: boolean; message?: string } | null;
 };
 
 const sessions = new Map<string, Session>();
@@ -99,16 +107,15 @@ function createEmptySession(orgId: string): Session {
     bus: new EventEmitter(),
     status: "closed",
     qr: null,
-    // baisse un peu la cache pour limiter la RAM en cas de storm
-    msgCache: new LRUCache({ max: 200 }),
+    qrSvg: null,
+    lastQrAt: null,
+    msgCache: new LRUCache({ max: 1000 }),
     chats: new Map(),
     contacts: new Map(),
-
-    startPromise: null,
-    reconnectTimer: null,
-    reconnectFailCount: 0,
-    lastKnownPhone: null,
-    stableSessionId: null,
+    startPromise: undefined,
+    restartTimer: null,
+    restartAttempt: 0,
+    lastClose: null,
   };
 }
 
@@ -122,13 +129,12 @@ function getBus(orgId: string): EventEmitter {
 }
 
 function phoneToJid(to: string): string {
-  // Si c'est déjà un JID complet (@lid, @s.whatsapp.net, @g.us, etc.), on le garde tel quel
   if (to.includes("@")) return to;
   const digits = to.replace(/[^\d]/g, "").replace(/^00/, "");
   return `${digits}@s.whatsapp.net`;
 }
 
-// Helper PN JID -> LID JID (best-effort)
+// Helper: PN JID -> LID JID (best-effort)
 async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> {
   const lidStore = sock?.signalRepository?.lidMapping;
   if (!lidStore || typeof lidStore.getLIDForPN !== "function") return null;
@@ -140,7 +146,6 @@ async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> 
     const s = String(raw);
     if (!s) return null;
 
-    // selon impl: "124..." ou "124...@lid"
     return s.includes("@") ? s : `${s}@lid`;
   } catch {
     return null;
@@ -187,49 +192,14 @@ async function clearSessionAuth(orgId: string) {
   }
 }
 
-// ----------- Anti-storm helpers
-
-function computeBackoffMs(failCount: number) {
-  // 30s, 60s, 120s, 240s, 300s max + jitter
-  const base = Math.min(Math.pow(2, failCount + 1) * 15_000, 300_000);
-  const jitter = Math.floor(Math.random() * 10_000);
-  return base + jitter;
-}
-
-async function destroySock(sess: Session, reason: string) {
-  const sock: any = sess.sock;
-  if (!sock) return;
-
-  try {
-    sock.ev?.removeAllListeners?.();
-  } catch {}
-
-  try {
-    sock.ws?.removeAllListeners?.();
-  } catch {}
-
-  try {
-    sock.end?.(new Error(reason));
-  } catch {}
-
-  try {
-    sock.ws?.close?.();
-  } catch {}
-
-  sess.sock = undefined;
-  sess.saveCreds = undefined;
-}
-
 // ----------- Helpers divers
 
-// NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
   const [local, domain] = jid.split("@");
   if (!local) return null;
 
-  // Cas à ignorer pour le "numéro"
   if (
     domain === "lid" ||
     domain === "g.us" ||
@@ -245,7 +215,7 @@ function jidToPhone(jid?: string | null): string | null {
 }
 
 function getConnectedPhone(sess: Session): string | null {
-  const jid = sess.sock?.user?.id; // ex: "41782640976:52@s.whatsapp.net" ou "3615...@lid"
+  const jid = sess.sock?.user?.id;
   if (!jid) return null;
   const main = jid.split(":")[0];
   const digits = main.replace(/[^\d]/g, "");
@@ -255,12 +225,8 @@ function getConnectedPhone(sess: Session): string | null {
 function buildMediaUrl(orgId: string, msgId: string): string | null {
   if (!PUBLIC_URL) return null;
   const base = PUBLIC_URL.replace(/\/+$/, "");
-  return `${base}/wa/media/${encodeURIComponent(orgId)}/${encodeURIComponent(
-    msgId
-  )}`;
+  return `${base}/wa/media/${encodeURIComponent(orgId)}/${encodeURIComponent(msgId)}`;
 }
-
-// ----------- Helper: extraire le texte d’un message
 
 function extractMessageBody(msg: WAMessage): string | undefined {
   const m: any = msg.message;
@@ -276,13 +242,7 @@ function extractMessageBody(msg: WAMessage): string | undefined {
   return undefined;
 }
 
-// ----------- Helper: envoyer vers le webhook externe
-
-async function postWebhook(
-  event: string,
-  orgId: string,
-  payload: any
-): Promise<void> {
+async function postWebhook(event: string, orgId: string, payload: any): Promise<void> {
   if (!WEBHOOK_URL) return;
 
   try {
@@ -300,8 +260,6 @@ async function postWebhook(
     logger.error({ err, orgId, event }, "webhook error");
   }
 }
-
-// ----------- Helper: payload style Z-API pour un message
 
 function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any {
   const m: any = msg.message || {};
@@ -334,7 +292,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     instanceId: orgId,
     messageId: msg.key.id,
 
-    // champs utiles pour wa-webhook
     remoteJid: remoteJid || null,
     chatId: remoteJid || null,
     phone: contactPhone,
@@ -351,7 +308,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     type: "ReceivedCallback",
     fromApi: false,
 
-    // Nouveau: bloc contact complet
     contact: contact
       ? {
           id: contact.id,
@@ -367,11 +323,9 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
         },
   };
 
-  // Texte
   const body = extractMessageBody(msg);
   if (body) base.text = { message: body };
 
-  // Audio
   if (m.audioMessage) {
     base.audio = {
       ptt: !!m.audioMessage.ptt,
@@ -382,7 +336,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     };
   }
 
-  // Image
   if (m.imageMessage) {
     base.image = {
       imageUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -395,7 +348,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     };
   }
 
-  // Video
   if (m.videoMessage) {
     base.video = {
       videoUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -406,7 +358,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     };
   }
 
-  // Document
   if (m.documentMessage) {
     base.document = {
       documentUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -416,7 +367,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     };
   }
 
-  // Réaction
   if (m.reactionMessage) {
     base.reaction = {
       value:
@@ -438,7 +388,6 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
   return base;
 }
 
-// Helpers pour normaliser ce qu’on garde en mémoire
 function normalizeChat(raw: any): ChatSummary | null {
   if (!raw || !raw.id) return null;
   const id = raw.id as string;
@@ -464,7 +413,6 @@ function normalizeContact(raw: any): ContactSummary | null {
   const notify = raw.notify;
   const shortName = raw.shortName || raw.name || raw.pushName || raw.verifiedName || name;
 
-  // Tentative best-effort pour récupérer le numéro
   let phone: string | null = null;
 
   if (typeof raw.waid === "string") {
@@ -484,52 +432,85 @@ function normalizeContact(raw: any): ContactSummary | null {
 
   if (!phone) phone = jidToPhone(id);
 
-  return { id, name, notify, shortName, phone, raw: STORE_RAW_CONTACT ? raw : undefined };
+  return { id, name, notify, shortName, phone, raw };
 }
 
-// ----------- Session bootstrap
+// ----------- Restart helpers (gateway-side anti-storm)
 
-let cachedBaileysVersion: any = null;
-let cachedBaileysVersionAt = 0;
-
-async function getBaileysVersionCached() {
-  const now = Date.now();
-  if (cachedBaileysVersion && now - cachedBaileysVersionAt < 10 * 60_000) {
-    return cachedBaileysVersion;
-  }
-  const r = await fetchLatestBaileysVersion();
-  cachedBaileysVersion = r.version;
-  cachedBaileysVersionAt = now;
-  return cachedBaileysVersion;
+function computeRestartDelayMs(attempt: number): number {
+  const exp = Math.min(attempt, 5); // cap exponent growth
+  const base = Math.min(RESTART_BASE_MS * Math.pow(2, exp), RESTART_MAX_MS);
+  const jitter = Math.floor(Math.random() * RESTART_JITTER_MS);
+  return base + jitter;
 }
+
+function shouldClearAuth(code: number): boolean {
+  // Only wipe creds when credentials are actually lost
+  return code === DisconnectReason.loggedOut || code === DisconnectReason.badSession;
+}
+
+function isQrExpiredClose(message?: string): boolean {
+  if (!message) return false;
+  return message.toLowerCase().includes("qr refs attempts ended");
+}
+
+async function cleanupSocket(sess: Session, reason: string) {
+  const old = sess.sock as any;
+  if (!old) return;
+
+  try {
+    old.ev?.removeAllListeners?.();
+  } catch {}
+
+  try {
+    // Baileys socket exposes end() in most versions
+    old.end?.(new Error(reason));
+  } catch {}
+
+  try {
+    // Some builds keep ws under sock.ws
+    old.ws?.close?.();
+  } catch {}
+
+  sess.sock = undefined;
+}
+
+// ----------- Session bootstrap (anti-concurrency)
 
 async function startSession(orgId: string): Promise<Session> {
   let sess = sessions.get(orgId);
-
   if (!sess) {
     sess = createEmptySession(orgId);
     sessions.set(orgId, sess);
   }
 
-  // Mutex: si un start est déjà en cours, renvoyer le même
-  if (sess.startPromise) return sess.startPromise;
-
-  // Si une socket existe déjà et que la session n'est pas closed, ne pas recréer
-  if (sess.sock && ["starting", "qr", "connecting", "connected"].includes(sess.status)) {
+  if (sess.sock && sess.status === "connected" && sess.sock.user) {
     return sess;
+  }
+
+  if (sess.startPromise) {
+    return sess.startPromise;
   }
 
   sess.status = "starting";
 
   sess.startPromise = (async () => {
-    // Safety: si une ancienne sock traîne, on la détruit avant de recréer
-    if (sess!.sock) await destroySock(sess!, "restart_before_start");
+    // prevent stacking restarts
+    if (sess?.restartTimer) {
+      clearTimeout(sess.restartTimer);
+      sess.restartTimer = null;
+    }
+
+    await fs.ensureDir(SESSIONS_DIR);
 
     const authDir = path.join(SESSIONS_DIR, orgId);
     await fs.ensureDir(authDir);
 
+    // cleanup previous socket if any
+    await cleanupSocket(sess!, "restart");
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const version = await getBaileysVersionCached();
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
       version,
@@ -548,92 +529,92 @@ async function startSession(orgId: string): Promise<Session> {
     sess!.saveCreds = saveCreds;
     sess!.status = "connecting";
     sess!.qr = null;
+    sess!.qrSvg = null;
+    sess!.lastQrAt = null;
 
-    // Sauvegarde des creds
+    // Save creds
     sock.ev.on("creds.update", saveCreds);
 
-    // Événements de connexion
+    // Connection events
     sock.ev.on("connection.update", (u: any) => {
       const { connection, lastDisconnect, qr } = u;
 
       if (qr) {
         sess!.qr = qr;
         sess!.status = "qr";
-        getBus(orgId).emit("status", { type: "qr", qr });
+        sess!.lastQrAt = Date.now();
+
+        // Cache svg once to make /wa/qr fast
+        void (async () => {
+          try {
+            sess!.qrSvg = await QRCode.toString(qr, { type: "svg" });
+          } catch {
+            sess!.qrSvg = null;
+          }
+          getBus(orgId).emit("status", { type: "qr", qr });
+          getBus(orgId).emit("qr", { qr, svg: sess!.qrSvg });
+        })();
       }
 
       if (connection === "open") {
         sess!.status = "connected";
         sess!.qr = null;
-
-        // reset backoff + cancel timer
-        sess!.reconnectFailCount = 0;
-        if (sess!.reconnectTimer) {
-          clearTimeout(sess!.reconnectTimer);
-          sess!.reconnectTimer = null;
-        }
-
-        const phoneDigits = getConnectedPhone(sess!) || null;
-        sess!.lastKnownPhone = phoneDigits;
-        sess!.stableSessionId = phoneDigits ? `wa_${orgId}_${phoneDigits}` : null;
+        sess!.qrSvg = null;
+        sess!.lastQrAt = null;
+        sess!.restartAttempt = 0;
+        sess!.lastClose = null;
 
         getBus(orgId).emit("status", { type: "connected", user: sock.user });
-        logger.info({ orgId, phoneDigits }, "WA connected");
+        logger.info({ orgId }, "WA connected");
 
-        void postWebhook("connection.open", orgId, {
-          user: sock.user,
-          phone: phoneDigits,
-          sessionId: sess!.stableSessionId,
-        });
+        void postWebhook("connection.open", orgId, { user: sock.user });
         return;
       }
 
       if (connection === "close") {
         const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
+        const message: string | undefined =
+          (lastDisconnect as any)?.error?.message || (lastDisconnect as any)?.error?.toString?.();
 
-        // Ces codes doivent stopper la reconnexion automatique
-        // Important: on évite de clear auth sauf logout/badSession
-        const fatalCodes: number[] = [
-          DisconnectReason.loggedOut,
-          DisconnectReason.badSession,
-          DisconnectReason.forbidden,
-          DisconnectReason.connectionReplaced,
-        ];
+        // Do not auto-restart infinitely when QR expired (user never scanned)
+        const qrExpired = isQrExpiredClose(message);
 
-        const willReconnect = !fatalCodes.includes(code);
+        // Decide reconnect
+        const willReconnect = !qrExpired && !shouldClearAuth(code);
 
         sess!.status = "closed";
+        sess!.lastClose = { code, willReconnect, message };
+
         getBus(orgId).emit("status", { type: "closed", code, willReconnect });
+        logger.warn({ orgId, code, willReconnect, message }, "WA closed");
 
-        logger.warn({ orgId, code, willReconnect }, "WA closed");
+        // Send enough info so webhook can parse phone from user.id if needed
+        void postWebhook("connection.close", orgId, { code, willReconnect, message, user: sock.user });
 
-        void postWebhook("connection.close", orgId, {
-          code,
-          willReconnect,
-          phone: sess!.lastKnownPhone,
-          sessionId: sess!.stableSessionId,
-          user: sock.user || null,
-        });
-
-        // Nettoie la sock pour éviter fuite mémoire
-        void destroySock(sess!, `closed_${code}`);
-
-        if (!willReconnect) {
-          // clear auth seulement si vrai logout/bad session
-          if (code === DisconnectReason.loggedOut || code === DisconnectReason.badSession) {
-            clearSessionAuth(orgId).catch(() => {});
-          }
-
-          // stop
+        // If creds truly lost, clear auth and stop
+        if (shouldClearAuth(code)) {
+          sessions.delete(orgId);
+          void clearSessionAuth(orgId);
           return;
         }
 
-        // schedule reconnect avec backoff, et un seul timer max
-        if (!sess!.reconnectTimer) {
-          const delay = computeBackoffMs(sess!.reconnectFailCount++);
-          sess!.reconnectTimer = setTimeout(() => {
-            sess!.reconnectTimer = null;
-            logger.info({ orgId, code, delay }, "auto-restart WA session (backoff)");
+        // If QR expired, do not restart automatically (wait for user action /wa/login)
+        if (qrExpired) {
+          // keep session object so /wa/status can show "closed"
+          return;
+        }
+
+        if (willReconnect) {
+          // Schedule restart with backoff and dedupe
+          const attempt = (sess!.restartAttempt || 0) + 1;
+          sess!.restartAttempt = attempt;
+
+          if (sess!.restartTimer) return;
+
+          const delay = computeRestartDelayMs(attempt);
+          sess!.restartTimer = setTimeout(() => {
+            sess!.restartTimer = null;
+            logger.info({ orgId, code, attempt, delay }, "auto-restart WA session");
             startSession(orgId).catch((err) =>
               logger.error({ err, orgId }, "failed to restart session")
             );
@@ -642,7 +623,7 @@ async function startSession(orgId: string): Promise<Session> {
       }
     });
 
-    // Historique initial (chats, contacts, messages)
+    // History initial
     sock.ev.on("messaging-history.set", (payload: any) => {
       const { chats, contacts, messages, syncType } = payload || {};
 
@@ -674,7 +655,7 @@ async function startSession(orgId: string): Promise<Session> {
       });
     });
 
-    // Chats & contacts live updates
+    // Chats updates
     sock.ev.on("chats.upsert", (up: any) => {
       const arr = Array.isArray(up) ? up : up?.chats || [];
       const updated: ChatSummary[] = [];
@@ -715,6 +696,7 @@ async function startSession(orgId: string): Promise<Session> {
       if (updated.length) getBus(orgId).emit("chats", { type: "update", chats: updated });
     });
 
+    // Contacts updates
     sock.ev.on("contacts.upsert", (up: any) => {
       const arr = Array.isArray(up) ? up : up?.contacts || [];
       const updated: ContactSummary[] = [];
@@ -745,7 +727,7 @@ async function startSession(orgId: string): Promise<Session> {
           phone:
             existing.phone ??
             (typeof u.waid === "string" ? u.waid.replace(/[^\d]/g, "") : existing.phone),
-          raw: existing.raw ?? (STORE_RAW_CONTACT ? u : undefined),
+          raw: existing.raw ?? u,
         };
 
         sess!.contacts.set(id, merged);
@@ -755,7 +737,7 @@ async function startSession(orgId: string): Promise<Session> {
       if (updated.length) getBus(orgId).emit("contacts", { type: "update", contacts: updated });
     });
 
-    // Messages entrants => cache + bus + webhook (INBOUND uniquement)
+    // Incoming messages
     sock.ev.on("messages.upsert", (m: any) => {
       const up = m.messages || [];
       for (const msg of up as WAMessage[]) {
@@ -788,10 +770,8 @@ async function startSession(orgId: string): Promise<Session> {
           },
         };
 
-        // SSE pour Lovable (UI)
         getBus(orgId).emit("message", { type: "message", message: simplified });
 
-        // Webhook Supabase (INBOUND)
         if (!msg.key.fromMe) {
           const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
           void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
@@ -814,13 +794,9 @@ async function startSession(orgId: string): Promise<Session> {
 
   try {
     return await sess.startPromise;
-  } catch (err) {
-    // si start échoue, remettre état safe
-    sess.status = "closed";
-    throw err;
   } finally {
-    // libérer le mutex start même si erreur
-    sess.startPromise = null;
+    const s = sessions.get(orgId);
+    if (s) s.startPromise = undefined;
   }
 }
 
@@ -850,11 +826,12 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     hasQR: Boolean(s?.qr),
     connected: Boolean(s?.sock?.user),
     user: s?.sock?.user || null,
+    lastClose: s?.lastClose || null,
   });
 
   if (s?.qr) {
-    const qrSvg = await QRCode.toString(s.qr, { type: "svg" });
-    send("qr", { qr: s.qr, svg: qrSvg });
+    const svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
+    send("qr", { qr: s.qr, svg });
   }
 
   if (s && (s.chats.size || s.contacts.size)) {
@@ -867,6 +844,7 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   }
 
   const onStatus = (data: any) => send("status", data);
+  const onQr = (data: any) => send("qr", data);
   const onMessage = (data: any) => send("message", data);
   const onUpdate = (data: any) => send("messages.update", data);
   const onReceipt = (data: any) => send("receipt", data);
@@ -875,6 +853,7 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   const onContacts = (data: any) => send("contacts", data);
 
   bus.on("status", onStatus);
+  bus.on("qr", onQr);
   bus.on("message", onMessage);
   bus.on("messages.update", onUpdate);
   bus.on("receipt", onReceipt);
@@ -889,6 +868,7 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   req.on("close", () => {
     clearInterval(interval);
     bus.off("status", onStatus);
+    bus.off("qr", onQr);
     bus.off("message", onMessage);
     bus.off("messages.update", onUpdate);
     bus.off("receipt", onReceipt);
@@ -906,12 +886,21 @@ app.post("/wa/login", async (req: Request, res: Response) => {
 
   try {
     const s = await startSession(String(orgId));
-    res.json({
+
+    // Return QR immediately if already available
+    const out: any = {
       ok: true,
       status: s.status,
       hasQR: Boolean(s.qr),
       user: s.sock?.user || null,
-    });
+    };
+
+    if (s.qr) {
+      out.qr = s.qr;
+      out.svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
+    }
+
+    res.json(out);
   } catch (err) {
     logger.error({ err, orgId }, "login error");
     res.status(500).json({ ok: false, error: String(err) });
@@ -929,6 +918,7 @@ app.get("/wa/status", async (req: Request, res: Response) => {
     hasQR: Boolean(s?.qr),
     user: s?.sock?.user || null,
     connected: Boolean(s?.sock?.user),
+    lastClose: s?.lastClose || null,
   });
 });
 
@@ -950,7 +940,6 @@ app.post("/wa/resolve", async (req: Request, res: Response) => {
 
   const baseJid = phoneToJid(input);
 
-  // si pas connecté: renvoyer JSON propre (pas de HTML)
   if (!sock || !sock.user) {
     return res.json({
       ok: true,
@@ -963,7 +952,6 @@ app.post("/wa/resolve", async (req: Request, res: Response) => {
   }
 
   try {
-    // déjà LID / groupe / etc
     if (!baseJid.endsWith("@s.whatsapp.net")) {
       return res.json({
         ok: true,
@@ -1001,11 +989,13 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   const s = sessions.get(orgId);
   if (!s?.qr) return res.status(404).json({ ok: false, error: "No pending QR" });
 
-  const svg = await QRCode.toString(s.qr, { type: "svg" });
+  const svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
+  s.qrSvg = svg;
+
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// Bootstrap : renvoyer les dernières conversations + contacts
+// Bootstrap conversations + contacts
 app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
@@ -1024,7 +1014,7 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   res.json({ ok: true, chats: chats.slice(0, limit), contacts });
 });
 
-// Avatar à la demande
+// Avatar on demand
 app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
@@ -1055,11 +1045,6 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
     await s?.sock?.logout();
   } catch (e) {
     logger.warn({ e, orgId: id }, "logout error (ignored)");
-  }
-
-  if (s?.reconnectTimer) {
-    clearTimeout(s.reconnectTimer);
-    s.reconnectTimer = null;
   }
 
   sessions.delete(id);
@@ -1352,7 +1337,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       mimeLookup("bin") ||
       "application/octet-stream";
 
-    const base64 = (buffer as Buffer).toString("base64");
+    const base64 = buffer.toString("base64");
 
     res.json({
       ok: true,
@@ -1364,7 +1349,6 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
   }
 });
 
-// GET direct pour media (pour audioUrl / imageUrl style Z-API)
 app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.params;
   if (!orgId || !msgId) {
