@@ -10,7 +10,6 @@ import { lookup as mimeLookup } from "mime-types";
 import { EventEmitter } from "events";
 import QRCode from "qrcode";
 
-// Baileys
 import makeWASocket, {
   WASocket,
   useMultiFileAuthState,
@@ -28,22 +27,13 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PORT = Number(process.env.PORT || 3000);
 
-// On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
   path.join(process.cwd(), "sessions");
 
-// Webhook (Make / Supabase / autre)
 const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
-
-// URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
-
-// Restart tuning
-const RESTART_BASE_MS = 1000;
-const RESTART_MAX_MS = 30_000;
-const RESTART_JITTER_MS = 500;
 
 // ----------- App
 
@@ -79,27 +69,33 @@ type Session = {
   sock?: WASocket;
   saveCreds?: () => Promise<void>;
   bus: EventEmitter;
-
   qr?: string | null;
-  qrSvg?: string | null;
-  lastQrAt?: number | null;
-
   status: SessionStatus;
-
   msgCache: LRUCache<string, WAMessage>;
   chats: Map<string, ChatSummary>;
   contacts: Map<string, ContactSummary>;
 
-  // Anti-concurrency
-  startPromise?: Promise<Session>;
-
-  // Restart control
-  restartTimer?: NodeJS.Timeout | null;
-  restartAttempt?: number;
-  lastClose?: { code: number; willReconnect: boolean; message?: string } | null;
+  reconnectTimer?: NodeJS.Timeout | null;
+  reconnectAttempts: number;
 };
 
 const sessions = new Map<string, Session>();
+
+// Anti double-start par orgId
+const startLocks = new Map<string, Promise<Session>>();
+
+// Cache Baileys version (évite refetch à chaque reconnect)
+let cachedVersionPromise: Promise<{ version: any }> | null = null;
+async function getBaileysVersion(): Promise<any> {
+  if (!cachedVersionPromise) {
+    cachedVersionPromise = fetchLatestBaileysVersion().catch((err) => {
+      logger.warn({ err }, "fetchLatestBaileysVersion failed, using undefined version");
+      return { version: undefined };
+    });
+  }
+  const { version } = await cachedVersionPromise;
+  return version;
+}
 
 function createEmptySession(orgId: string): Session {
   return {
@@ -107,15 +103,11 @@ function createEmptySession(orgId: string): Session {
     bus: new EventEmitter(),
     status: "closed",
     qr: null,
-    qrSvg: null,
-    lastQrAt: null,
     msgCache: new LRUCache({ max: 1000 }),
     chats: new Map(),
     contacts: new Map(),
-    startPromise: undefined,
-    restartTimer: null,
-    restartAttempt: 0,
-    lastClose: null,
+    reconnectTimer: null,
+    reconnectAttempts: 0,
   };
 }
 
@@ -134,7 +126,6 @@ function phoneToJid(to: string): string {
   return `${digits}@s.whatsapp.net`;
 }
 
-// Helper: PN JID -> LID JID (best-effort)
 async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> {
   const lidStore = sock?.signalRepository?.lidMapping;
   if (!lidStore || typeof lidStore.getLIDForPN !== "function") return null;
@@ -180,8 +171,6 @@ function getSessionOr404(orgId: string, res: Response): Session | null {
   return s;
 }
 
-// ----------- Helper pour effacer complètement l’auth disque
-
 async function clearSessionAuth(orgId: string) {
   const authDir = path.join(SESSIONS_DIR, orgId);
   try {
@@ -191,8 +180,6 @@ async function clearSessionAuth(orgId: string) {
     logger.error({ err, orgId, authDir }, "failed clearing auth directory");
   }
 }
-
-// ----------- Helpers divers
 
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
@@ -435,82 +422,58 @@ function normalizeContact(raw: any): ContactSummary | null {
   return { id, name, notify, shortName, phone, raw };
 }
 
-// ----------- Restart helpers (gateway-side anti-storm)
-
-function computeRestartDelayMs(attempt: number): number {
-  const exp = Math.min(attempt, 5); // cap exponent growth
-  const base = Math.min(RESTART_BASE_MS * Math.pow(2, exp), RESTART_MAX_MS);
-  const jitter = Math.floor(Math.random() * RESTART_JITTER_MS);
-  return base + jitter;
+async function getQrSvg(qr: string): Promise<string> {
+  return QRCode.toString(qr, { type: "svg" });
 }
 
-function shouldClearAuth(code: number): boolean {
-  // Only wipe creds when credentials are actually lost
-  return code === DisconnectReason.loggedOut || code === DisconnectReason.badSession;
+function scheduleReconnect(sess: Session, orgId: string, code: number) {
+  if (sess.reconnectTimer) return;
+
+  const attempt = Math.min(sess.reconnectAttempts, 6);
+  const base = Math.min(1000 * Math.pow(2, attempt), 30_000);
+  const jitter = Math.floor(Math.random() * 500);
+
+  const delay = base + jitter;
+  sess.reconnectTimer = setTimeout(() => {
+    sess.reconnectTimer = null;
+    sess.reconnectAttempts += 1;
+
+    logger.info({ orgId, code, delay, attempt: sess.reconnectAttempts }, "auto-restart WA session");
+    startSession(orgId).catch((err) => logger.error({ err, orgId }, "failed to restart session"));
+  }, delay);
 }
-
-function isQrExpiredClose(message?: string): boolean {
-  if (!message) return false;
-  return message.toLowerCase().includes("qr refs attempts ended");
-}
-
-async function cleanupSocket(sess: Session, reason: string) {
-  const old = sess.sock as any;
-  if (!old) return;
-
-  try {
-    old.ev?.removeAllListeners?.();
-  } catch {}
-
-  try {
-    // Baileys socket exposes end() in most versions
-    old.end?.(new Error(reason));
-  } catch {}
-
-  try {
-    // Some builds keep ws under sock.ws
-    old.ws?.close?.();
-  } catch {}
-
-  sess.sock = undefined;
-}
-
-// ----------- Session bootstrap (anti-concurrency)
 
 async function startSession(orgId: string): Promise<Session> {
-  let sess = sessions.get(orgId);
-  if (!sess) {
-    sess = createEmptySession(orgId);
-    sessions.set(orgId, sess);
-  }
+  const existing = sessions.get(orgId);
+  if (existing?.sock && existing.status === "connected") return existing;
 
-  if (sess.sock && sess.status === "connected" && sess.sock.user) {
-    return sess;
-  }
+  const locked = startLocks.get(orgId);
+  if (locked) return locked;
 
-  if (sess.startPromise) {
-    return sess.startPromise;
-  }
-
-  sess.status = "starting";
-
-  sess.startPromise = (async () => {
-    // prevent stacking restarts
-    if (sess?.restartTimer) {
-      clearTimeout(sess.restartTimer);
-      sess.restartTimer = null;
+  const promise = (async () => {
+    let sess = sessions.get(orgId);
+    if (!sess) {
+      sess = createEmptySession(orgId);
+      sessions.set(orgId, sess);
     }
 
-    await fs.ensureDir(SESSIONS_DIR);
+    sess.status = "starting";
 
     const authDir = path.join(SESSIONS_DIR, orgId);
     await fs.ensureDir(authDir);
 
-    // cleanup previous socket if any
-    await cleanupSocket(sess!, "restart");
-
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const { version } = await fetchLatestBaileysVersion();
+    const version = await getBaileysVersion();
+
+    // Cleanup old socket listeners if any
+    if (sess.sock) {
+      try {
+        (sess.sock as any).ev?.removeAllListeners?.();
+      } catch {}
+      try {
+        (sess.sock as any).end?.(new Error("restart"));
+      } catch {}
+    }
 
     const sock = makeWASocket({
       version,
@@ -525,105 +488,81 @@ async function startSession(orgId: string): Promise<Session> {
       markOnlineOnConnect: false,
     });
 
-    sess!.sock = sock;
-    sess!.saveCreds = saveCreds;
-    sess!.status = "connecting";
-    sess!.qr = null;
-    sess!.qrSvg = null;
-    sess!.lastQrAt = null;
+    sess.sock = sock;
+    sess.saveCreds = saveCreds;
+    sess.status = "connecting";
+    sess.qr = null;
 
-    // Save creds
     sock.ev.on("creds.update", saveCreds);
 
-    // Connection events
     sock.ev.on("connection.update", (u: any) => {
       const { connection, lastDisconnect, qr } = u;
 
       if (qr) {
         sess!.qr = qr;
         sess!.status = "qr";
-        sess!.lastQrAt = Date.now();
 
-        // Cache svg once to make /wa/qr fast
-        void (async () => {
-          try {
-            sess!.qrSvg = await QRCode.toString(qr, { type: "svg" });
-          } catch {
-            sess!.qrSvg = null;
-          }
-          getBus(orgId).emit("status", { type: "qr", qr });
-          getBus(orgId).emit("qr", { qr, svg: sess!.qrSvg });
-        })();
+        getBus(orgId).emit("status", { type: "qr", qr });
+
+        // Optionnel: webhook QR si tu veux
+        // void postWebhook("connection.qr", orgId, { qr });
+
+        return;
       }
 
       if (connection === "open") {
         sess!.status = "connected";
         sess!.qr = null;
-        sess!.qrSvg = null;
-        sess!.lastQrAt = null;
-        sess!.restartAttempt = 0;
-        sess!.lastClose = null;
+        sess!.reconnectAttempts = 0;
+        if (sess!.reconnectTimer) {
+          clearTimeout(sess!.reconnectTimer);
+          sess!.reconnectTimer = null;
+        }
 
         getBus(orgId).emit("status", { type: "connected", user: sock.user });
         logger.info({ orgId }, "WA connected");
 
-        void postWebhook("connection.open", orgId, { user: sock.user });
+        void postWebhook("connection.open", orgId, {
+          user: sock.user,
+          phone: getConnectedPhone(sess!),
+        });
         return;
       }
 
       if (connection === "close") {
         const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
-        const message: string | undefined =
-          (lastDisconnect as any)?.error?.message || (lastDisconnect as any)?.error?.toString?.();
 
-        // Do not auto-restart infinitely when QR expired (user never scanned)
-        const qrExpired = isQrExpiredClose(message);
+        const fatalCodes: number[] = [
+          DisconnectReason.loggedOut,
+          DisconnectReason.forbidden,
+          DisconnectReason.badSession,
+          DisconnectReason.connectionReplaced,
+        ];
 
-        // Decide reconnect
-        const willReconnect = !qrExpired && !shouldClearAuth(code);
+        const willReconnect = !fatalCodes.includes(code);
 
         sess!.status = "closed";
-        sess!.lastClose = { code, willReconnect, message };
-
         getBus(orgId).emit("status", { type: "closed", code, willReconnect });
-        logger.warn({ orgId, code, willReconnect, message }, "WA closed");
 
-        // Send enough info so webhook can parse phone from user.id if needed
-        void postWebhook("connection.close", orgId, { code, willReconnect, message, user: sock.user });
+        logger.warn({ orgId, code, willReconnect }, "WA closed");
 
-        // If creds truly lost, clear auth and stop
-        if (shouldClearAuth(code)) {
+        // Critique: envoyer phone/user pour cibler wa_numbers côté Supabase
+        void postWebhook("connection.close", orgId, {
+          code,
+          willReconnect,
+          user: sock.user,
+          phone: getConnectedPhone(sess!),
+        });
+
+        if (!willReconnect) {
           sessions.delete(orgId);
-          void clearSessionAuth(orgId);
-          return;
-        }
-
-        // If QR expired, do not restart automatically (wait for user action /wa/login)
-        if (qrExpired) {
-          // keep session object so /wa/status can show "closed"
-          return;
-        }
-
-        if (willReconnect) {
-          // Schedule restart with backoff and dedupe
-          const attempt = (sess!.restartAttempt || 0) + 1;
-          sess!.restartAttempt = attempt;
-
-          if (sess!.restartTimer) return;
-
-          const delay = computeRestartDelayMs(attempt);
-          sess!.restartTimer = setTimeout(() => {
-            sess!.restartTimer = null;
-            logger.info({ orgId, code, attempt, delay }, "auto-restart WA session");
-            startSession(orgId).catch((err) =>
-              logger.error({ err, orgId }, "failed to restart session")
-            );
-          }, delay);
+          clearSessionAuth(orgId).catch(() => {});
+        } else {
+          scheduleReconnect(sess!, orgId, code);
         }
       }
     });
 
-    // History initial
     sock.ev.on("messaging-history.set", (payload: any) => {
       const { chats, contacts, messages, syncType } = payload || {};
 
@@ -655,7 +594,6 @@ async function startSession(orgId: string): Promise<Session> {
       });
     });
 
-    // Chats updates
     sock.ev.on("chats.upsert", (up: any) => {
       const arr = Array.isArray(up) ? up : up?.chats || [];
       const updated: ChatSummary[] = [];
@@ -696,7 +634,6 @@ async function startSession(orgId: string): Promise<Session> {
       if (updated.length) getBus(orgId).emit("chats", { type: "update", chats: updated });
     });
 
-    // Contacts updates
     sock.ev.on("contacts.upsert", (up: any) => {
       const arr = Array.isArray(up) ? up : up?.contacts || [];
       const updated: ContactSummary[] = [];
@@ -737,7 +674,6 @@ async function startSession(orgId: string): Promise<Session> {
       if (updated.length) getBus(orgId).emit("contacts", { type: "update", contacts: updated });
     });
 
-    // Incoming messages
     sock.ev.on("messages.upsert", (m: any) => {
       const up = m.messages || [];
       for (const msg of up as WAMessage[]) {
@@ -792,15 +728,16 @@ async function startSession(orgId: string): Promise<Session> {
     return sess!;
   })();
 
+  startLocks.set(orgId, promise);
+
   try {
-    return await sess.startPromise;
+    return await promise;
   } finally {
-    const s = sessions.get(orgId);
-    if (s) s.startPromise = undefined;
+    startLocks.delete(orgId);
   }
 }
 
-// ----------- SSE (événements temps réel)
+// ----------- SSE
 
 app.get("/wa/sse", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
@@ -826,12 +763,11 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     hasQR: Boolean(s?.qr),
     connected: Boolean(s?.sock?.user),
     user: s?.sock?.user || null,
-    lastClose: s?.lastClose || null,
   });
 
   if (s?.qr) {
-    const svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
-    send("qr", { qr: s.qr, svg });
+    const qrSvg = await getQrSvg(s.qr);
+    send("qr", { qr: s.qr, svg: qrSvg });
   }
 
   if (s && (s.chats.size || s.contacts.size)) {
@@ -843,8 +779,16 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
     });
   }
 
-  const onStatus = (data: any) => send("status", data);
-  const onQr = (data: any) => send("qr", data);
+  const onStatus = async (data: any) => {
+    // Si on reçoit {type:"qr", qr}, on enrichit avec svg
+    if (data?.type === "qr" && data?.qr && !data?.svg) {
+      try {
+        data.svg = await getQrSvg(data.qr);
+      } catch {}
+    }
+    send("status", data);
+  };
+
   const onMessage = (data: any) => send("message", data);
   const onUpdate = (data: any) => send("messages.update", data);
   const onReceipt = (data: any) => send("receipt", data);
@@ -853,7 +797,6 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   const onContacts = (data: any) => send("contacts", data);
 
   bus.on("status", onStatus);
-  bus.on("qr", onQr);
   bus.on("message", onMessage);
   bus.on("messages.update", onUpdate);
   bus.on("receipt", onReceipt);
@@ -868,7 +811,6 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
   req.on("close", () => {
     clearInterval(interval);
     bus.off("status", onStatus);
-    bus.off("qr", onQr);
     bus.off("message", onMessage);
     bus.off("messages.update", onUpdate);
     bus.off("receipt", onReceipt);
@@ -881,28 +823,94 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
 // ----------- Auth / Status
 
 app.post("/wa/login", async (req: Request, res: Response) => {
-  const { orgId } = req.body || {};
+  const { orgId, waitQrMs } = req.body || {};
   if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
 
+  const org = String(orgId);
+  const waitMs = Math.max(0, Math.min(Number(waitQrMs || 1200), 5000));
+
   try {
-    const s = await startSession(String(orgId));
+    const s = await startSession(org);
 
-    // Return QR immediately if already available
-    const out: any = {
-      ok: true,
-      status: s.status,
-      hasQR: Boolean(s.qr),
-      user: s.sock?.user || null,
-    };
-
-    if (s.qr) {
-      out.qr = s.qr;
-      out.svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
+    // Si déjà connecté
+    if (s.sock?.user && s.status === "connected") {
+      return res.json({
+        ok: true,
+        status: s.status,
+        hasQR: false,
+        user: s.sock.user,
+        qr: null,
+        svg: null,
+      });
     }
 
-    res.json(out);
+    // Si QR déjà dispo tout de suite
+    if (s.qr) {
+      const svg = await getQrSvg(s.qr);
+      return res.json({
+        ok: true,
+        status: s.status,
+        hasQR: true,
+        user: s.sock?.user || null,
+        qr: s.qr,
+        svg,
+      });
+    }
+
+    // Attente courte pour attraper le QR si il arrive juste après (améliore la vitesse perçue)
+    if (waitMs > 0) {
+      const bus = getBus(org);
+      const got = await new Promise<{ qr: string; svg: string } | null>((resolve) => {
+        const t = setTimeout(() => {
+          cleanup();
+          resolve(null);
+        }, waitMs);
+
+        const onStatus = async (data: any) => {
+          if (data?.type === "qr" && data?.qr) {
+            try {
+              const svg = await getQrSvg(String(data.qr));
+              cleanup();
+              resolve({ qr: String(data.qr), svg });
+            } catch {
+              cleanup();
+              resolve(null);
+            }
+          }
+        };
+
+        const cleanup = () => {
+          clearTimeout(t);
+          bus.off("status", onStatus);
+        };
+
+        bus.on("status", onStatus);
+      });
+
+      if (got) {
+        const current = sessions.get(org);
+        return res.json({
+          ok: true,
+          status: current?.status || "qr",
+          hasQR: true,
+          user: current?.sock?.user || null,
+          qr: got.qr,
+          svg: got.svg,
+        });
+      }
+    }
+
+    // Fallback: pas de QR encore, le front poll /wa/qr
+    res.json({
+      ok: true,
+      status: s.status,
+      hasQR: false,
+      user: s.sock?.user || null,
+      qr: null,
+      svg: null,
+    });
   } catch (err) {
-    logger.error({ err, orgId }, "login error");
+    logger.error({ err, orgId: org }, "login error");
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
@@ -918,11 +926,9 @@ app.get("/wa/status", async (req: Request, res: Response) => {
     hasQR: Boolean(s?.qr),
     user: s?.sock?.user || null,
     connected: Boolean(s?.sock?.user),
-    lastClose: s?.lastClose || null,
   });
 });
 
-// Endpoint utilisé par l'edge function wa-resolve
 app.post("/wa/resolve", async (req: Request, res: Response) => {
   const { orgId, to, peer, phone } = req.body || {};
   const input = String(to || peer || phone || "").trim();
@@ -989,13 +995,10 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   const s = sessions.get(orgId);
   if (!s?.qr) return res.status(404).json({ ok: false, error: "No pending QR" });
 
-  const svg = s.qrSvg || (await QRCode.toString(s.qr, { type: "svg" }));
-  s.qrSvg = svg;
-
+  const svg = await getQrSvg(s.qr);
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// Bootstrap conversations + contacts
 app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
@@ -1014,7 +1017,6 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   res.json({ ok: true, chats: chats.slice(0, limit), contacts });
 });
 
-// Avatar on demand
 app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
@@ -1047,13 +1049,18 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
     logger.warn({ e, orgId: id }, "logout error (ignored)");
   }
 
+  if (s?.reconnectTimer) {
+    clearTimeout(s.reconnectTimer);
+    s.reconnectTimer = null;
+  }
+
   sessions.delete(id);
   await clearSessionAuth(id);
 
   res.json({ ok: true });
 });
 
-// ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
+// ----------- OUTBOUND
 
 app.post("/wa/send/text", async (req: Request, res: Response) => {
   const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
@@ -1197,92 +1204,7 @@ app.post("/wa/send/audio", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/wa/send/buttons", async (req: Request, res: Response) => {
-  const { orgId, to, text, footer, buttons } = req.body || {};
-  if (!orgId || !to || !text || !Array.isArray(buttons)) {
-    return res.status(400).json({ ok: false, error: "orgId,to,text,buttons required" });
-  }
-
-  const s = getSessionOr404(String(orgId), res);
-  if (!s) return;
-
-  try {
-    const jid = phoneToJid(String(to));
-
-    const msg: AnyMessageContent = {
-      text,
-      footer,
-      buttons: buttons.map((b: any, i: number) => ({
-        buttonId: String(b.id ?? `btn_${i + 1}`),
-        buttonText: { displayText: String(b.label ?? b.text ?? `Option ${i + 1}`) },
-        type: 1,
-      })),
-      headerType: 1,
-    } as any;
-
-    const sent = await s.sock!.sendMessage(jid, msg);
-    const key = sent?.key;
-    if (!key) throw new Error("sendMessage returned no key");
-
-    void postWebhook("message.outgoing", String(orgId), {
-      kind: "buttons",
-      to: jid,
-      key,
-      text,
-    });
-
-    res.json({ ok: true, key });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-app.post("/wa/send/list", async (req: Request, res: Response) => {
-  const { orgId, to, title, text, footer, buttonText, sections } = req.body || {};
-  if (!orgId || !to || !text || !Array.isArray(sections)) {
-    return res.status(400).json({ ok: false, error: "orgId,to,text,sections required" });
-  }
-
-  const s = getSessionOr404(String(orgId), res);
-  if (!s) return;
-
-  try {
-    const jid = phoneToJid(String(to));
-
-    const msg: AnyMessageContent = {
-      text,
-      footer,
-      title,
-      buttonText: buttonText || "Choisir",
-      sections: sections.map((sec: any) => ({
-        title: String(sec.title || ""),
-        rows: (sec.rows || []).map((r: any, i: number) => ({
-          rowId: String(r.id ?? `row_${i + 1}`),
-          title: String(r.title ?? `Option ${i + 1}`),
-          description: r.description ? String(r.description) : undefined,
-        })),
-      })),
-    } as any;
-
-    const sent = await s.sock!.sendMessage(jid, msg);
-    const key = sent?.key;
-    if (!key) throw new Error("sendMessage returned no key");
-
-    void postWebhook("message.outgoing", String(orgId), {
-      kind: "list",
-      to: jid,
-      key,
-      title,
-      text,
-    });
-
-    res.json({ ok: true, key });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// ----------- Lecture messages récents (et médias)
+// ----------- Lecture messages récents + médias
 
 app.get("/wa/messages/recent", (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
