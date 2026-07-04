@@ -708,9 +708,13 @@ async function startSession(orgId: string): Promise<Session> {
 
         getBus(orgId).emit("message", { type: "message", message: simplified });
 
-        if (!msg.key.fromMe) {
+        // Webhook pour TOUS les messages : entrants ET sortants tapés sur le téléphone.
+        // Les envois via API postent déjà "message.outgoing" depuis les endpoints /wa/send/*,
+        // le webhook Supabase déduplique par messageId.
+        {
           const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
-          void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
+          const event = msg.key.fromMe ? "message.outgoing.sync" : "message.incoming";
+          void postWebhook(event, orgId, { ...simplified, zapi: zmsg });
         }
       }
     });
