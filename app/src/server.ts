@@ -1349,6 +1349,103 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   }
 });
 
+// ----------- Vérification de numéros WhatsApp (v4)
+// À COLLER dans : github.com/waoobusiness/Baileys — branche "app" — fichier app/src/server.ts
+// (c'est CE repo que Render déploie, pas zuria_wa !)
+// Emplacement : juste AVANT la ligne  // ----------- Health
+//
+// Adapté à cette version du serveur (pas de checkAuth ici — auth optionnelle inline).
+// Un numéro par requête Baileys → insensible au format PN/LID des réponses.
+//
+// POST /wa/check-numbers   Body: { orgId: string, numbers: string[] }  (max 50)
+// Réponse: { ok: true, results: [{ number, input, exists, jid }] }
+
+app.post("/wa/check-numbers", async (req: Request, res: Response) => {
+  // Auth optionnelle : n'exige une clé que si WA_API_KEY est définie sur Render
+  const requiredKey =
+    process.env.WA_API_KEY ||
+    process.env.GATEWAY_API_KEY ||
+    process.env.WA_GATEWAY_API_KEY ||
+    "";
+  if (requiredKey) {
+    const auth = String(req.headers["authorization"] || "");
+    const provided =
+      String(req.headers["x-api-key"] || "") ||
+      (auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "");
+    if (provided !== requiredKey) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+  }
+
+  const { orgId, numbers } = req.body || {};
+
+  if (!orgId || !Array.isArray(numbers) || numbers.length === 0) {
+    return res.status(400).json({ ok: false, error: "orgId, numbers[] required" });
+  }
+
+  if (numbers.length > 50) {
+    return res.status(400).json({ ok: false, error: "max 50 numbers per call" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  const toDigits = (n: string) =>
+    String(n).replace(/[^\d]/g, "").replace(/^00/, "");
+
+  try {
+    const results: {
+      number: string;
+      input: string;
+      exists: boolean;
+      jid: string | null;
+    }[] = [];
+
+    for (let i = 0; i < numbers.length; i++) {
+      const input = String(numbers[i]);
+      const digits = toDigits(input);
+
+      let exists = false;
+      let jid: string | null = null;
+
+      if (digits.length >= 6) {
+        try {
+          // ✅ UN numéro par appel : la réponse (0 ou 1 entrée) correspond
+          // forcément à CE numéro, que le jid retourné soit PN ou LID.
+          const found = await (s.sock as any).onWhatsApp(digits);
+          const hit: any = Array.isArray(found) ? found[0] : null;
+          if (hit) {
+            exists = hit.exists !== false;
+            jid = hit.jid ? String(hit.jid) : null;
+          }
+        } catch (err) {
+          logger.warn({ err, input, orgId }, "check-numbers: onWhatsApp failed for one number");
+        }
+      }
+
+      results.push({ number: input, input, exists, jid: exists ? jid : null });
+
+      if (i < numbers.length - 1) {
+        await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 400)));
+      }
+    }
+
+    logger.info(
+      {
+        orgId,
+        total: numbers.length,
+        found: results.filter((r) => r.exists).length,
+        sample: results.slice(0, 3),
+      },
+      "GW /wa/check-numbers done (v4)"
+    );
+
+    return res.json({ ok: true, results });
+  } catch (err) {
+    logger.error({ err, orgId }, "GW /wa/check-numbers error");
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 // ----------- Health
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "zuria-baileys", ts: Date.now() }));
