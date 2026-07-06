@@ -209,6 +209,25 @@ function getConnectedPhone(sess: Session): string | null {
   return digits || null;
 }
 
+// ✅ Récupère remoteJidAlt (couple PN<->LID certifié par WhatsApp) sur la clé du message
+function getRemoteJidAlt(msg: WAMessage): string | null {
+  return (((msg.key as any)?.remoteJidAlt as string) || null) ?? null;
+}
+
+// ✅ Sépare une liste de JID en PN (@s.whatsapp.net) et LID (@lid)
+function splitPnLid(
+  ...jids: (string | null | undefined)[]
+): { peerPn: string | null; peerLid: string | null } {
+  let peerPn: string | null = null;
+  let peerLid: string | null = null;
+  for (const j of jids) {
+    if (!j) continue;
+    if (j.endsWith("@s.whatsapp.net") && !peerPn) peerPn = j;
+    else if (j.endsWith("@lid") && !peerLid) peerLid = j;
+  }
+  return { peerPn, peerLid };
+}
+
 function buildMediaUrl(orgId: string, msgId: string): string | null {
   if (!PUBLIC_URL) return null;
   const base = PUBLIC_URL.replace(/\/+$/, "");
@@ -683,9 +702,14 @@ async function startSession(orgId: string): Promise<Session> {
         const body = extractMessageBody(msg);
 
         const remoteJid = msg.key.remoteJid as string | undefined;
-        const phoneFromJid = jidToPhone(remoteJid || "");
+        const remoteJidAlt = getRemoteJidAlt(msg);
+        // ✅ Couple PN<->LID certifié par WhatsApp (remoteJid + remoteJidAlt)
+        const { peerPn, peerLid } = splitPnLid(remoteJid, remoteJidAlt);
+        // Téléphone SÛR : uniquement depuis un JID PN réel (jamais depuis un @lid)
+        const phoneFromJid = jidToPhone(peerPn || remoteJid || "");
         const contact =
           (remoteJid && sess!.contacts.get(remoteJid)) ||
+          (peerPn && sess!.contacts.get(peerPn)) ||
           (phoneFromJid ? sess!.contacts.get(`${phoneFromJid}@s.whatsapp.net`) : undefined);
         const contactPhone = contact?.phone ?? phoneFromJid ?? null;
         const contactName =
@@ -694,6 +718,11 @@ async function startSession(orgId: string): Promise<Session> {
         const simplified = {
           id: msg.key.id,
           from: remoteJid,
+          // ✅ identifiants certifiés pour résolution fiable côté Supabase
+          peer: remoteJid || null,
+          peerPn,
+          peerLid,
+          remoteJidAlt,
           fromMe: msg.key.fromMe,
           pushName: (msg as any).pushName,
           timestamp: (msg.messageTimestamp || 0).toString(),
@@ -1077,6 +1106,13 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
 
   try {
     const jid = phoneToJid(String(to));
+    // ✅ résout le LID de destination (certifié) pour que Supabase lie contact<->LID dès l'envoi
+    const toPn = jid.endsWith("@s.whatsapp.net") ? jid : null;
+    let toLid: string | null = jid.endsWith("@lid") ? jid : null;
+    if (!toLid && toPn) {
+      try { toLid = await getLidForPnJid(s.sock as any, toPn); } catch {}
+    }
+
     const options: any = {};
 
     if (quotedMsgId) {
@@ -1092,14 +1128,20 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
     const key = sent?.key;
     if (!key) throw new Error("sendMessage returned no key");
 
+    // le JID réellement utilisé par Baileys peut être un LID
+    const sentJid = (key as any)?.remoteJid as string | undefined;
+    if (!toLid && sentJid && sentJid.endsWith("@lid")) toLid = sentJid;
+
     void postWebhook("message.outgoing", String(orgId), {
       kind: "text",
       to: jid,
+      toPn,
+      toLid,
       key,
       body: String(text),
     });
 
-    res.json({ ok: true, key });
+    res.json({ ok: true, key, to: jid, toPn, toLid });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
