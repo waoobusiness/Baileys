@@ -9,7 +9,7 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc.6",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "express": "^4.19.2",
     "pino": "^9.0.0",
     "cors": "^2.8.5",
