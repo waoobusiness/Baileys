@@ -1440,30 +1440,7 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
     return res.status(500).json({ ok: false, error: String(err) });
   }
 });
-// ----------- Presence (composing / paused / available)
 
-app.post("/wa/presence", async (req: Request, res: Response) => {
-  const { orgId, to, state } = req.body || {};
-  if (!orgId || !to) {
-    return res.status(400).json({ ok: false, error: "orgId,to required" });
-  }
-
-  const s = getSessionOr404(String(orgId), res);
-  if (!s) return;
-
-  try {
-    const jid = phoneToJid(String(to));
-
-    // Se marquer "en ligne" aide l'indicateur à s'afficher, puis "composing"
-    try { await s.sock!.sendPresenceUpdate("available"); } catch {}
-    try { await s.sock!.presenceSubscribe(jid); } catch {}
-    await s.sock!.sendPresenceUpdate(String(state || "composing"), jid);
-
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
-  }
-});
 // ----------- Presence (en train d'écrire)
 app.post("/wa/presence", requireGatewayAuth, async (req: Request, res: Response) => {
   const { orgId, to, state } = req.body || {};
