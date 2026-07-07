@@ -1440,9 +1440,8 @@ app.post("/wa/check-numbers", async (req: Request, res: Response) => {
     return res.status(500).json({ ok: false, error: String(err) });
   }
 });
-
 // ----------- Presence (en train d'écrire)
-app.post("/wa/presence", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/presence", async (req: Request, res: Response) => {
   const { orgId, to, state } = req.body || {};
   if (!orgId || !to) {
     return res.status(400).json({ ok: false, error: "orgId,to required" });
@@ -1452,18 +1451,17 @@ app.post("/wa/presence", requireGatewayAuth, async (req: Request, res: Response)
   if (!s) return;
 
   try {
-    const { sendJid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
-
+    const jid = phoneToJid(String(to));
     try { await s.sock!.sendPresenceUpdate("available"); } catch {}
-    try { await s.sock!.presenceSubscribe(sendJid); } catch {}
-    await s.sock!.sendPresenceUpdate(((state as string) || "composing") as any, sendJid);
+    try { await s.sock!.presenceSubscribe(jid); } catch {}
+    await s.sock!.sendPresenceUpdate(((state as string) || "composing") as any, jid);
 
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
+
 // ----------- Health
 
 app.get("/health", (_req, res) =>
