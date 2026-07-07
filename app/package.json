@@ -11,7 +11,7 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc.9",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "cors": "^2.8.5",
     "eventemitter3": "^5.0.1",
     "express": "^4.21.2",
